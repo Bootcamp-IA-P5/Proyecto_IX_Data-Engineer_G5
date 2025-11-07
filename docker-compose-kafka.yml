@@ -41,3 +41,5 @@ networks:
   kafka-net:
     name: kafka-net # nombre fijo para compartir
     driver: bridge
+
+# Networks , servira como un puente de conexion entre los contenedores. 

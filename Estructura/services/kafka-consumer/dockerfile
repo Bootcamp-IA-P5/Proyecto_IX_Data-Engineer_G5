@@ -1,0 +1,62 @@
+# ============================================================
+# DOCKERFILE - KAFKA CONSUMER SERVICE
+# ============================================================
+# Imagen base: Python 3.11 slim (más ligera que la estándar)
+FROM python:3.11-slim
+
+# Metadata del contenedor
+LABEL maintainer="Proyecto_IX_Data-Engineer_G5"
+LABEL description="Kafka Consumer para procesamiento de datos HR"
+LABEL version="1.0"
+
+# Variables de entorno para Python
+# PYTHONUNBUFFERED=1: Muestra logs en tiempo real (no buffer)
+# PYTHONDONTWRITEBYTECODE=1: No crea archivos .pyc (reduce tamaño)
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Instalar dependencias del sistema necesarias para confluent-kafka
+# librdkafka-dev: Librería C para Kafka
+# gcc: Compilador necesario para construir confluent-kafka
+# Las dependencias se limpian después para reducir el tamaño de la imagen
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    librdkafka-dev \
+    gcc \
+    g++ \
+    make && \
+    rm -rf /var/lib/apt/lists/*
+
+# Crear directorio de trabajo
+WORKDIR /app
+
+# Copiar requirements primero (mejor aprovechamiento de cache de Docker)
+# Si solo cambian archivos .py, no se reinstalan las dependencias
+COPY requirements.txt .
+
+# Instalar dependencias de Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar el código fuente
+COPY src/ ./src/
+
+# Crear usuario no-root para mayor seguridad
+# No ejecutar servicios como root en producción
+RUN useradd -m -u 1000 kafkauser && \
+    chown -R kafkauser:kafkauser /app
+
+# Cambiar a usuario no-root
+USER kafkauser
+
+# Puerto (informativo, el consumer no expone puertos)
+# EXPOSE no es necesario para este servicio
+
+# Healthcheck: Verifica que el proceso esté corriendo
+# Cada 30 segundos, con timeout de 10s, 3 reintentos antes de marcar como unhealthy
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD ps aux | grep -v grep | grep consumer.py || exit 1
+
+# Comando por defecto al iniciar el contenedor
+CMD ["python", "src/consumer.py"]

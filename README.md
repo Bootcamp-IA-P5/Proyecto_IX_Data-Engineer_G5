@@ -1,5 +1,31 @@
 # Proyecto_IX_Data-Engineer_G5
 
+## 🚀 Setup Rápido
+
+**IMPORTANTE**: Este proyecto requiere un generador de datos externo.
+
+### 📥 Para empezar:
+
+1. **Configurar Kafka + Generador de Datos**
+   ```bash
+   # Ver instrucciones detalladas en:
+   cat SETUP_KAFKA_GENERATOR.md
+   ```
+
+2. **Ejecutar nuestros servicios**
+   ```bash
+   cd Estructura/services/kafka-consumer
+   cp .env.example .env
+   pip install -r requirements.txt
+   python src/consumer.py
+   ```
+
+**📖 Documentación completa**: Ver `SETUP_KAFKA_GENERATOR.md`
+
+---
+
+## 📁 Estructura del Proyecto
+
 Estructura/
 │
 ├── 📂 services/                      # Microservicios separados

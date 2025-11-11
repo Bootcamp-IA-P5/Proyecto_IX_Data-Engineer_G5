@@ -20,6 +20,7 @@ class KafkaService:
     """Servicio para gestionar Kafka Producer y Consumer"""
     
     def __init__(self):
+        self.bootstrap_servers = settings.kafka_bootstrap_servers
         self.producer: Optional[Producer] = None
         self.consumer: Optional[Consumer] = None
         self.admin_client: Optional[AdminClient] = None
@@ -27,7 +28,7 @@ class KafkaService:
         
         # Configuración del producer
         self.producer_config = {
-            'bootstrap.servers': settings.kafka_bootstrap_servers,
+            'bootstrap.servers': self.bootstrap_servers,
             'client.id': 'hr-pro-api-producer',
             'acks': 'all',  # Esperar confirmación de todos los brokers
             'retries': 3,
@@ -36,7 +37,7 @@ class KafkaService:
         
         # Configuración del consumer
         self.consumer_config = {
-            'bootstrap.servers': settings.kafka_bootstrap_servers,
+            'bootstrap.servers': self.bootstrap_servers,
             'group.id': settings.kafka_group_id,
             'auto.offset.reset': 'earliest',
             'enable.auto.commit': False,
@@ -114,86 +115,108 @@ class KafkaService:
     async def produce_message(
         self,
         topic: str,
-        data: Dict,
-        key: Optional[str] = None
-    ) -> bool:
+        value: Dict,
+        key: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None
+    ) -> Dict:
         """
         Enviar un mensaje a Kafka
         
         Args:
             topic: Nombre del topic
-            data: Datos a enviar (serán convertidos a JSON)
+            value: Datos a enviar (serán convertidos a JSON)
             key: Clave del mensaje (opcional)
+            headers: Headers del mensaje (opcional)
         
         Returns:
-            bool: True si se envió correctamente
+            Dict con información del envío
         """
         try:
             # Agregar metadata
-            data['_metadata'] = {
+            value['_metadata'] = {
                 'timestamp': datetime.utcnow().isoformat(),
                 'source': 'hr-pro-api',
                 'version': settings.app_version
             }
             
             # Serializar a JSON
-            message_value = json.dumps(data).encode('utf-8')
+            message_value = json.dumps(value).encode('utf-8')
             message_key = key.encode('utf-8') if key else None
+            
+            # Convertir headers a formato Kafka
+            kafka_headers = None
+            if headers:
+                kafka_headers = [(k, v.encode('utf-8')) for k, v in headers.items()]
+            
+            # Variable para capturar resultado
+            result = {'success': False, 'partition': None, 'offset': None}
+            
+            def custom_callback(err, msg):
+                if err:
+                    logger.error(f"❌ Error enviando mensaje: {err}")
+                    result['error'] = str(err)
+                else:
+                    result['success'] = True
+                    result['partition'] = msg.partition()
+                    result['offset'] = msg.offset()
+                    logger.debug(
+                        f"✅ Mensaje enviado a {msg.topic()} "
+                        f"[partition: {msg.partition()}, offset: {msg.offset()}]"
+                    )
             
             # Producir mensaje
             self.producer.produce(
                 topic=topic,
                 value=message_value,
                 key=message_key,
-                callback=self.delivery_callback
+                headers=kafka_headers,
+                callback=custom_callback
             )
             
             # Flush para asegurar envío
-            self.producer.poll(0)
+            self.producer.flush(timeout=5)
             
             logger.info(f"📤 Mensaje enviado a topic: {topic}")
-            return True
+            return result
             
         except Exception as e:
             logger.error(f"❌ Error produciendo mensaje: {e}")
-            return False
+            return {'success': False, 'error': str(e)}
     
     async def produce_batch(
         self,
-        topic: str,
         messages: List[Dict]
-    ) -> Dict[str, int]:
+    ) -> List[Dict]:
         """
         Enviar múltiples mensajes a Kafka
         
         Args:
-            topic: Nombre del topic
-            messages: Lista de mensajes a enviar
+            messages: Lista de mensajes con formato {topic, key, value, headers}
         
         Returns:
-            Dict con estadísticas de envío
+            Lista de resultados para cada mensaje
         """
-        stats = {'success': 0, 'failed': 0}
+        results = []
         
-        for message in messages:
-            success = await self.produce_message(topic, message)
-            if success:
-                stats['success'] += 1
-            else:
-                stats['failed'] += 1
+        for msg_data in messages:
+            result = await self.produce_message(
+                topic=msg_data.get('topic'),
+                value=msg_data.get('value'),
+                key=msg_data.get('key'),
+                headers=msg_data.get('headers')
+            )
+            results.append(result)
         
-        # Flush todos los mensajes pendientes
-        remaining = self.producer.flush(timeout=10)
-        if remaining > 0:
-            logger.warning(f"⚠️  {remaining} mensajes no se pudieron enviar")
-            stats['failed'] += remaining
+        # Contar estadísticas
+        success_count = sum(1 for r in results if r.get('success'))
+        failed_count = len(results) - success_count
         
         logger.info(
-            f"📊 Batch enviado: {stats['success']} exitosos, "
-            f"{stats['failed']} fallidos"
+            f"📊 Batch enviado: {success_count} exitosos, "
+            f"{failed_count} fallidos"
         )
         
-        return stats
+        return results
     
     def create_consumer(self, topics: List[str]) -> Consumer:
         """
@@ -270,6 +293,153 @@ class KafkaService:
             )
         
         return stats
+    
+    async def consume_messages(
+        self,
+        topic: str,
+        max_messages: int = 10,
+        timeout: float = 5.0
+    ) -> List[Dict]:
+        """
+        Consumir mensajes de un topic específico
+        
+        Args:
+            topic: Nombre del topic
+            max_messages: Número máximo de mensajes a consumir
+            timeout: Timeout en segundos
+        
+        Returns:
+            Lista de mensajes consumidos
+        """
+        consumer_config = self.consumer_config.copy()
+        consumer_config['group.id'] = f"{consumer_config['group.id']}-temp-{datetime.utcnow().timestamp()}"
+        
+        consumer = Consumer(consumer_config)
+        consumer.subscribe([topic])
+        
+        messages = []
+        start_time = datetime.utcnow()
+        
+        try:
+            while len(messages) < max_messages:
+                # Verificar timeout
+                elapsed = (datetime.utcnow() - start_time).total_seconds()
+                if elapsed >= timeout:
+                    break
+                
+                msg = consumer.poll(timeout=1.0)
+                
+                if msg is None:
+                    continue
+                
+                if msg.error():
+                    if msg.error().code() == KafkaError._PARTITION_EOF:
+                        continue
+                    else:
+                        logger.error(f"❌ Error en consumer: {msg.error()}")
+                        continue
+                
+                try:
+                    # Decodificar mensaje
+                    value = json.loads(msg.value().decode('utf-8'))
+                    key = msg.key().decode('utf-8') if msg.key() else None
+                    
+                    # Extraer headers
+                    headers = {}
+                    if msg.headers():
+                        headers = {k: v.decode('utf-8') for k, v in msg.headers()}
+                    
+                    messages.append({
+                        'topic': msg.topic(),
+                        'partition': msg.partition(),
+                        'offset': msg.offset(),
+                        'key': key,
+                        'value': value,
+                        'timestamp': datetime.fromtimestamp(msg.timestamp()[1] / 1000),
+                        'headers': headers
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error decodificando mensaje: {e}")
+            
+        finally:
+            consumer.close()
+            logger.info(f"📥 Consumidos {len(messages)} mensajes del topic {topic}")
+        
+        return messages
+    
+    async def list_topics(self) -> List[str]:
+        """
+        Listar todos los topics disponibles
+        
+        Returns:
+            Lista de nombres de topics
+        """
+        return await self.list_all_topics()
+    
+    async def create_topic(
+        self,
+        topic_name: str,
+        num_partitions: int = 1,
+        replication_factor: int = 1,
+        config: Optional[Dict[str, str]] = None
+    ) -> bool:
+        """
+        Crear un nuevo topic
+        
+        Args:
+            topic_name: Nombre del topic
+            num_partitions: Número de particiones
+            replication_factor: Factor de replicación
+            config: Configuración adicional
+        
+        Returns:
+            True si se creó exitosamente
+        """
+        try:
+            new_topic = NewTopic(
+                topic=topic_name,
+                num_partitions=num_partitions,
+                replication_factor=replication_factor,
+                config=config or {}
+            )
+            
+            fs = self.admin_client.create_topics([new_topic])
+            
+            # Esperar a que se complete
+            for topic, f in fs.items():
+                f.result()
+                logger.info(f"✅ Topic creado: {topic}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error creando topic {topic_name}: {e}")
+            return False
+    
+    async def delete_topic(self, topic_name: str) -> bool:
+        """
+        Eliminar un topic
+        
+        Args:
+            topic_name: Nombre del topic a eliminar
+        
+        Returns:
+            True si se eliminó exitosamente
+        """
+        try:
+            fs = self.admin_client.delete_topics([topic_name])
+            
+            # Esperar a que se complete
+            for topic, f in fs.items():
+                f.result()
+                logger.info(f"✅ Topic eliminado: {topic}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error eliminando topic {topic_name}: {e}")
+            return False
     
     async def get_topic_info(self, topic: str) -> Optional[Dict]:
         """

@@ -91,8 +91,8 @@ async def global_exception_handler(request, exc):
 
 
 # Incluir routers
-app.include_router(health_router, prefix="/health", tags=["Health"])
-app.include_router(kafka_router, prefix="/kafka", tags=["Kafka"])
+app.include_router(health_router)
+app.include_router(kafka_router)
 
 
 @app.get("/")

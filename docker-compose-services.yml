@@ -1,2 +1,135 @@
-version: 'version'
+# ============================================================
+# DOCKER COMPOSE - SERVICIOS DE APLICACIÓN
+# ============================================================
+# Este archivo define los microservicios que procesan datos:
+# - kafka-consumer: Consume mensajes de Kafka
+# - data-processor: Procesa y transforma datos (por implementar)
+# - mongo-persister: Guarda datos en MongoDB (por implementar)
+# - sql-persister: Guarda datos en PostgreSQL (por implementar)
+# ============================================================
+
+version: '3.8'
+
 services:
+
+  # ----------------------------------------------------------
+  # KAFKA CONSUMER
+  # ----------------------------------------------------------
+  # Servicio que consume mensajes del topic de Kafka
+  # Lee en tiempo real y procesa diferentes tipos de datos
+  # ----------------------------------------------------------
+  kafka-consumer:
+    # Construir desde el directorio del servicio
+    build:
+      context: ./Estructura/services/kafka-consumer
+      dockerfile: dockerfile
+
+    # Nombre fijo del contenedor
+    container_name: kafka-consumer
+
+    # Cargar variables de entorno desde .env
+    env_file:
+      - ./Estructura/services/kafka-consumer/.env
+
+    # Dependencias: requiere que Kafka esté disponible
+    # NOTA: 'kafka' debe estar definido en docker-compose-kafka.yml
+    depends_on:
+      - kafka
+
+    # Red compartida con Kafka
+    networks:
+      - kafka-net
+
+    # Política de reinicio: siempre reiniciar si falla
+    restart: unless-stopped
+
+    # Logging configurado
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Healthcheck (definido en Dockerfile)
+    # Se verifica automáticamente cada 30s
+
+    # ----------------------------------------------------------
+    # DATA PROCESSOR (Por implementar)
+    # ----------------------------------------------------------
+    # Servicio que procesa y transforma los datos
+    # Aplica validaciones, limpieza y agregaciones
+    # ----------------------------------------------------------
+    # data-processor:
+    #   build:
+    #     context: ./Estructura/services/data-processor
+    #     dockerfile: Dockerfile
+    #   container_name: data-processor
+    #   env_file:
+    #     - ./Estructura/services/data-processor/.env
+    #   depends_on:
+    #     - kafka-consumer
+    #   networks:
+    #     - kafka-net
+    #   restart: unless-stopped
+
+    # ----------------------------------------------------------
+    # MONGO PERSISTER (Por implementar)
+    # ----------------------------------------------------------
+    # Servicio que guarda datos en MongoDB
+    # ----------------------------------------------------------
+    # mongo-persister:
+    #   build:
+    #     context: ./Estructura/services/mongo-persister
+    #     dockerfile: Dockerfile
+    #   container_name: mongo-persister
+    #   env_file:
+    #     - ./Estructura/services/mongo-persister/.env
+    #   depends_on:
+    #     - kafka-consumer
+    #   networks:
+    #     - kafka-net
+    #   restart: unless-stopped
+
+    # ----------------------------------------------------------
+    # SQL PERSISTER (Por implementar)
+    # ----------------------------------------------------------
+    # Servicio que guarda datos en PostgreSQL
+    # ----------------------------------------------------------
+    # sql-persister:
+    #   build:
+    #     context: ./Estructura/services/sql-persister
+    #     dockerfile: Dockerfile
+    #   container_name: sql-persister
+    #   env_file:
+    #     - ./Estructura/services/sql-persister/.env
+    #   depends_on:
+    #     - kafka-consumer
+    #   networks:
+    #     - kafka-net
+    #   restart: unless-stopped
+
+    # ============================================================
+    # REDES
+    # ============================================================
+    # Usa la red externa creada por docker-compose-kafka.yml
+    # ============================================================
+networks:
+  kafka-net:
+    # Red externa: ya existe, creada por docker-compose-kafka.yml
+    external: true
+    name: kafka-net
+
+# ============================================================
+# CÓMO USAR ESTE ARCHIVO
+# ============================================================
+# 1. Asegúrate de que docker-compose-kafka.yml esté corriendo:
+#    docker-compose -f docker-compose-kafka.yml up -d
+#
+# 2. Levanta los servicios de aplicación:
+#    docker-compose -f docker-compose-services.yml up -d
+#
+# 3. Ver logs:
+#    docker-compose -f docker-compose-services.yml logs -f kafka-consumer
+#
+# 4. Detener servicios:
+#    docker-compose -f docker-compose-services.yml down
+# ============================================================

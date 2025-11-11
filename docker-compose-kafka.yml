@@ -26,17 +26,17 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     networks:
       - kafka-net
+  # random_generator:
+  #   container_name: random_generator
+  #   build: ./datagen
+  #   depends_on:
+  #     - kafka
+  #   restart: always
+  #   networks:
+  #     - kafka-net
+  # NOTA: Comentado temporalmente - el directorio ./datagen no existe aún
 
-  random_generator:
-    container_name: random_generator
-    build: ./datagen
-    depends_on:
-      - kafka
-    restart: always
-    networks:
-      - kafka-net
-
-# Esto crea una red visible para otros docker-compose(bridge)
+  # Esto crea una red visible para otros docker-compose(bridge)
 networks:
   kafka-net:
     name: kafka-net # nombre fijo para compartir

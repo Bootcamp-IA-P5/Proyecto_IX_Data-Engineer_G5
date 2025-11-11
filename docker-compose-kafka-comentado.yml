@@ -1,0 +1,176 @@
+# ============================================================
+# DOCKER COMPOSE - KAFKA INFRASTRUCTURE
+# ============================================================
+# Este archivo define la infraestructura completa de Kafka:
+# - Zookeeper: Coordinador de Kafka
+# - Kafka Broker: Servidor de mensajería
+# - Random Generator: Productor de datos de prueba
+# ============================================================
+
+# Versión de Docker Compose a usar
+# Version '2' soporta redes personalizadas y es compatible con versiones antiguas
+version: '2'
+
+# ============================================================
+# SERVICIOS
+# ============================================================
+services:
+
+  # ----------------------------------------------------------
+  # ZOOKEEPER
+  # ----------------------------------------------------------
+  # Zookeeper es el coordinador de Kafka. Gestiona:
+  # - La metadata del cluster de Kafka
+  # - La configuración de topics
+  # - El estado de los brokers
+  # - La elección de líderes de particiones
+  # ----------------------------------------------------------
+  zookeeper:
+    # Imagen oficial de Confluent Platform (versión 7.5.0)
+    image: confluentinc/cp-zookeeper:7.5.0
+
+    # Variables de entorno para configurar Zookeeper
+    environment:
+      # Puerto en el que Zookeeper escucha las conexiones de clientes (Kafka)
+      # Los brokers de Kafka se conectarán a este puerto
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+      # Unidad básica de tiempo en milisegundos para Zookeeper
+      # Se usa para heartbeats y timeouts entre servidores
+      # 2000ms = 2 segundos
+      ZOOKEEPER_TICK_TIME: 2000
+
+    # Mapeo de puertos: [puerto_host]:[puerto_contenedor]
+    # Expone Zookeeper en el puerto 22181 del host
+    # Esto permite conectarse desde fuera del contenedor si es necesario
+    ports:
+      - 22181:2181
+
+    # Red a la que pertenece este servicio
+    # Permite la comunicación con otros contenedores en la misma red
+    networks:
+      - kafka-net
+
+  # ----------------------------------------------------------
+  # KAFKA BROKER
+  # ----------------------------------------------------------
+  # Kafka es el broker de mensajería distribuida. Gestiona:
+  # - Topics (canales de mensajes)
+  # - Particiones (divisiones de topics para escalabilidad)
+  # - Producers (publicadores de mensajes)
+  # - Consumers (lectores de mensajes)
+  # ----------------------------------------------------------
+  kafka:
+    # Nombre fijo del contenedor para facilitar referencias
+    # Otros servicios pueden conectarse usando "kafka" como hostname
+    container_name: kafka
+
+    # Imagen oficial de Confluent Platform para Kafka (versión 7.5.0)
+    image: confluentinc/cp-kafka:7.5.0
+
+    # Dependencia: Kafka necesita que Zookeeper esté corriendo primero
+    # Docker Compose iniciará Zookeeper antes de iniciar Kafka
+    depends_on:
+      - zookeeper
+
+    # Mapeo de puertos
+    # 29092: Puerto expuesto al host (para conexiones desde tu máquina local)
+    # 9092: Puerto interno para comunicación entre contenedores (no expuesto)
+    ports:
+      - 29092:29092
+
+    # Variables de entorno para configurar Kafka
+    environment:
+      # ID único del broker en el cluster (importante si hay múltiples brokers)
+      # En un cluster con un solo broker, puede ser cualquier número
+      KAFKA_BROKER_ID: 1
+
+      # Dirección de Zookeeper para coordinación
+      # "zookeeper:2181" usa el nombre del servicio como hostname
+      # Docker Compose resuelve automáticamente "zookeeper" a la IP del contenedor
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # LISTENERS: Define cómo Kafka escucha conexiones entrantes
+      # - PLAINTEXT://kafka:9092: Para conexiones INTERNAS (entre contenedores)
+      #   Los servicios dentro de Docker usan "kafka:9092"
+      # - PLAINTEXT_HOST://localhost:29092: Para conexiones EXTERNAS (desde tu máquina)
+      #   Tu máquina local usa "localhost:29092"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+
+      # Mapea nombres de listeners a protocolos de seguridad
+      # PLAINTEXT = sin encriptación (para desarrollo local)
+      # En producción usarías SSL o SASL_SSL
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+
+      # Listener que Kafka usa para comunicación entre brokers
+      # Si tuvieras múltiples brokers, se comunicarían usando este listener
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Factor de replicación para el topic interno de offsets
+      # 1 = sin replicación (apropiado para desarrollo con un solo broker)
+      # En producción con múltiples brokers, usarías 3 o más
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+    # Red compartida para comunicación con otros servicios
+    networks:
+      - kafka-net
+
+  # ----------------------------------------------------------
+  # RANDOM GENERATOR (PRODUCTOR DE DATOS)
+  # ----------------------------------------------------------
+  # Servicio que genera datos aleatorios y los envía a Kafka
+  # Simula un sistema que produce eventos en tiempo real
+  # ----------------------------------------------------------
+  random_generator:
+    # Nombre fijo del contenedor
+    container_name: random_generator
+
+    # Construye la imagen desde el directorio ./datagen
+    # NOTA: Actualmente este directorio no existe en tu proyecto
+    # Necesitarás crearlo o comentar este servicio si no lo tienes
+    build: ./datagen
+
+    # Dependencia: necesita que Kafka esté listo antes de empezar
+    depends_on:
+      - kafka
+
+    # Política de reinicio: siempre reiniciar si el contenedor se detiene
+    # Útil para un generador que debe estar corriendo continuamente
+    restart: always
+
+    # Red compartida para enviar mensajes a Kafka
+    networks:
+      - kafka-net
+
+# ============================================================
+# REDES
+# ============================================================
+# Define redes personalizadas para comunicación entre contenedores
+# ============================================================
+networks:
+  # Red personalizada llamada "kafka-net"
+  kafka-net:
+    # Nombre fijo: permite que otros docker-compose se conecten a esta red
+    # Esto es CLAVE para arquitectura multi-servicios
+    # Otros archivos docker-compose pueden usar: external: true
+    name: kafka-net
+
+    # Driver bridge: red privada para comunicación entre contenedores
+    # - Los contenedores en esta red pueden verse entre sí por nombre
+    # - Están aislados de otras redes Docker
+    # - Puedes tener múltiples redes bridge en el mismo host
+    driver: bridge
+
+# ============================================================
+# CÓMO FUNCIONA LA ARQUITECTURA
+# ============================================================
+# 1. Zookeeper inicia primero y gestiona la coordinación
+# 2. Kafka inicia y se registra con Zookeeper
+# 3. Random Generator inicia y produce mensajes al topic de Kafka
+# 4. Los servicios en docker-compose-services.yml (kafka-consumer, etc.)
+#    se conectan a esta misma red "kafka-net" para consumir mensajes
+#
+# CONEXIONES:
+# - Desde CONTENEDORES: usar "kafka:9092"
+# - Desde TU MÁQUINA: usar "localhost:29092"
+# ============================================================

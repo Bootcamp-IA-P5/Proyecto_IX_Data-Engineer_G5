@@ -104,25 +104,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-    # ----------------------------------------------------------
-    # DATA PROCESSOR (Por implementar)
-    # ----------------------------------------------------------
-    # Servicio que procesa y transforma los datos
-    # Aplica validaciones, limpieza y agregaciones
-    # ----------------------------------------------------------
-    # data-processor:
-    #   build:
-    #     context: ./Estructura/services/data-processor
-    #     dockerfile: Dockerfile
-    #   container_name: data-processor
-    #   env_file:
-    #     - ./Estructura/services/data-processor/.env
-    #   depends_on:
-    #     - kafka-consumer
-    #   networks:
-    #     - kafka-net
-    #   restart: unless-stopped
-
   # ----------------------------------------------------------
   # MONGO PERSISTER
   # ----------------------------------------------------------
@@ -163,6 +144,51 @@ services:
     # Conectado a ambas redes: Kafka y servicios internos
     networks:
       - kafka-net
+      - services-net
+
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ----------------------------------------------------------
+  # DATA PROCESSOR
+  # ----------------------------------------------------------
+  # Servicio que agrupa datos crudos de MongoDB (Issue #6)
+  # Lee raw_messages, agrupa por persona, guarda en aggregated_data
+  # ----------------------------------------------------------
+  data-processor:
+    build:
+      context: ./Estructura/services/data-processor
+      dockerfile: Dockerfile
+
+    container_name: data-processor
+
+    # Variables explícitas (como mongo-persister)
+    environment:
+      # MongoDB
+      MONGO_URI: ${MONGO_URI}
+      MONGO_DATABASE: ${MONGO_DATABASE}
+      RAW_COLLECTION: ${RAW_COLLECTION:-raw_messages}
+      AGGREGATED_COLLECTION: ${AGGREGATED_COLLECTION:-aggregated_data}
+      
+      # Config de procesamiento
+      BATCH_SIZE: ${BATCH_SIZE:-1000}
+      PROCESSING_INTERVAL: ${PROCESSING_INTERVAL:-10}
+      GROUPING_WINDOW: ${GROUPING_WINDOW:-60}
+      STATS_INTERVAL: ${STATS_INTERVAL:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    
+    # Requiere MongoDB y mongo-persister
+    depends_on:
+      - mongo
+      - mongo-persister
+
+    # Red de servicios internos
+    networks:
       - services-net
 
     restart: unless-stopped

@@ -1,0 +1,8 @@
+# Cliente de MongoDB
+pymongo==4.6.0
+
+# Procesamiento de datos (si se necesita)
+pandas==2.1.0
+
+# Variables de entorno
+python-dotenv==1.0.0

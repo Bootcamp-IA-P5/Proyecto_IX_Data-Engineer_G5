@@ -1762,7 +1762,7 @@ docker exec hrpro-mongodb mongosh \
 # PARADA ORDENADA
 # ============================================================
 docker stop random_generator
-# Esperar hasta LAG = 0
+# Esperar hasta alcanzar LAG = 0
 docker-compose -f docker-compose-services.yml down
 docker-compose -f docker-compose-kafka.yml down
 

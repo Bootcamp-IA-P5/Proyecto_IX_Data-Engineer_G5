@@ -75,15 +75,6 @@ services:
     # ✅ AÑADIR: Timeout automático (se detiene después de X tiempo)
     stop_grace_period: 120s
   
-    # ✅ AÑADIR: Healthcheck que falla después de X segundos
-    healthcheck:
-      test: ["CMD-SHELL", "exit 1"]  # Siempre falla = se detiene
-      interval: 60s                  # Chequea cada 60 segundos
-      timeout: 10s
-      retries: 1                     # Solo 1 retry = se detiene rápido
-      start_period: 120s             # ← Ejecuta durante 2 minutos y luego se detiene
-       
-    
     logging:
       driver: "json-file"
       options:

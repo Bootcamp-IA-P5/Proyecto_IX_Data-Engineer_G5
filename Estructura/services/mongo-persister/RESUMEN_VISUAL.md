@@ -133,7 +133,7 @@ python src/persister.py
 - Testing: 15 min
 - **TOTAL: ~1 hora**
 
-## 📚 Archivos que Tu Compañero Necesita
+## 📚 Archivos documentación
 
 1. `TAREAS_MONGODB.md` → Instrucciones detalladas paso a paso
 2. `README.md` → Resumen técnico

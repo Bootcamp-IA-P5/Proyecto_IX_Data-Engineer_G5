@@ -1,6 +1,5 @@
 # 📋 TAREAS: MongoDB Persister - Persistir Datos Crudos
 
-## 👤 Responsable: [Nombre del compañero]
 ## 🎯 Objetivo: Configurar MongoDB y persistir los mensajes de Kafka en crudo
 
 ---

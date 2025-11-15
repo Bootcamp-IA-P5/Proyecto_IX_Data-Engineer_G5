@@ -157,7 +157,7 @@ services:
     
     # Requiere Kafka y MongoDB
     depends_on:
-    #  - kafka
+      #- kafka
       - mongo
 
     # Conectado a ambas redes: Kafka y servicios internos

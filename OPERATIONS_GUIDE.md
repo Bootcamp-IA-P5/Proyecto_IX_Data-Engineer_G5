@@ -1753,7 +1753,7 @@ docker exec kafka kafka-consumer-groups \
 
 # Documentos en MongoDB
 docker exec hrpro-mongodb mongosh \
-  --username xxxxxx --password xxxxxxx \
+  --username REPLACE_WITH_YOUR_USERNAME --password REPLACE_WITH_YOUR_PASSWORD \
   --authenticationDatabase admin \
   --eval "db.getSiblingDB('hrpro_db').raw_messages.countDocuments()" \
   --quiet

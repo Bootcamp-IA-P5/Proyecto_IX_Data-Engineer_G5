@@ -35,8 +35,12 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
       KAFKA_NUM_PARTITIONS: 3
-      KAFKA_LOG_RETENTION_HOURS: 1  # ← Cambiar de 168 (7 días) a 1 (1 hora)
-      KAFKA_LOG_RETENTION_BYTES: 524288000  # ← Límite de 500MB por partición
+      KAFKA_LOG_RETENTION_HOURS: 1  # Retención de logs: 1 hora
+      KAFKA_LOG_RETENTION_BYTES: 524288000  # Límite de 500MB por partición (3 particiones ≈ 1.5GB total para 1 hora)
+      # Con un generador produciendo ~1M mensajes/minuto, este límite puede llenarse rápidamente.
+      # Ajusta estos valores según el tamaño promedio de mensaje y el throughput esperado.
+      # Ejemplo de cálculo: Si cada mensaje es de 1KB, 1M mensajes/minuto ≈ 1GB/minuto, por lo que 1 hora ≈ 60GB.
+      # Considera aumentar la retención o el límite de bytes si necesitas almacenar más datos.
     
     networks:
       - kafka-net

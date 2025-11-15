@@ -19,6 +19,25 @@ MONGO_URI = os.getenv('MONGO_URI')
 MONGO_DB = os.getenv('MONGO_DATABASE')
 MONGO_COLLECTION = os.getenv('MONGO_COLLECTION')
 
+# Validación de variables de entorno críticas
+def validate_env_vars():
+    missing = []
+    if not KAFKA_BOOTSTRAP_SERVERS:
+        missing.append('KAFKA_BOOTSTRAP_SERVERS')
+    if not KAFKA_TOPIC:
+        missing.append('KAFKA_TOPIC')
+    if not MONGO_URI:
+        missing.append('MONGO_URI')
+    if not MONGO_DB:
+        missing.append('MONGO_DATABASE')
+    if not MONGO_COLLECTION:
+        missing.append('MONGO_COLLECTION')
+    if missing:
+        raise RuntimeError(
+            f"Faltan las siguientes variables de entorno requeridas: {', '.join(missing)}"
+        )
+
+validate_env_vars()
 # ============================================================
 # CONFIGURACIÓN DE LOGGING
 # ============================================================

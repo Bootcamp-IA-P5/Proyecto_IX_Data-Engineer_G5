@@ -71,6 +71,36 @@ db.raw_messages.countDocuments()
 db.raw_messages.find().limit(5).pretty()
 ```
 
+## 🧪 Tests
+
+### Ejecutar tests unitarios
+
+```bash
+# Desde el directorio del servicio
+cd Estructura/services/mongo-persister
+
+# Ejecutar todos los tests
+python -m unittest discover tests/
+
+# Ejecutar test específico
+python -m unittest tests.test_persister.TestDataPersister.test_init_successful
+
+# Con pytest (si está instalado)
+pytest tests/
+```
+
+### Cobertura de tests
+
+```bash
+# Instalar coverage
+pip install coverage
+
+# Ejecutar con cobertura
+coverage run -m unittest discover tests/
+coverage report
+coverage html  # Genera reporte HTML en htmlcov/
+```
+
 ## ✅ Checklist
 
 - [ ] MongoDB corriendo en Docker

@@ -1,5 +1,6 @@
 # Proyecto_IX_Data-Engineer_G5
 
+```
 Estructura/
 │
 ├── 📂 services/                      # Microservicios separados
@@ -134,3 +135,4 @@ Estructura/
 ├── .gitignore
 ├── .env.example                      # Variables de entorno ejemplo
 ├── README.md
+```

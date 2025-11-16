@@ -9,8 +9,8 @@ import sys
 import time
 from confluent_kafka import Consumer, KafkaException, KafkaError
 from typing import Dict, List
-import config
-from mongo_client import get_mongo_client
+from . import config
+from .mongo_client import get_mongo_client
 
 # Configurar logging
 logging.basicConfig(

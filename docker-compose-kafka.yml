@@ -1,7 +1,8 @@
-version: '2'
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    hostname: zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -9,14 +10,22 @@ services:
       - 22181:2181
     networks:
       - kafka-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   kafka:
     container_name: kafka
+    hostname: kafka
     image: confluentinc/cp-kafka:7.5.0
     depends_on:
       - zookeeper
     ports:
       - 29092:29092
+      - 9092:9092
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -24,22 +33,143 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 1  # ← Cambiar de 168 (7 días) a 1 (1 hora)
+      KAFKA_LOG_RETENTION_BYTES: 524288000  # ← Límite de 500MB por partición
+    
     networks:
       - kafka-net
-  # random_generator:
-  #   container_name: random_generator
-  #   build: ./datagen
-  #   depends_on:
-  #     - kafka
-  #   restart: always
-  #   networks:
-  #     - kafka-net
-  # NOTA: Comentado temporalmente - el directorio ./datagen no existe aún
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
-  # Esto crea una red visible para otros docker-compose(bridge)
+  # ============================================================
+  # GENERADOR DE DATOS (Fuente Externa - No Modificar)
+  # ============================================================
+  # Usa el generador legacy de Estructura/datagen
+  # Genera ~100 mensajes y se detiene
+  # Topic: probando
+  # ============================================================
+  random_generator:
+    container_name: random_generator
+    build: 
+      context: ./Estructura/datagen
+      dockerfile: Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - kafka-net
+    restart: "no"  # Se detiene al terminar (no reinicia)
+    
+    # ✅ AÑADIR: Timeout automático (se detiene después de X tiempo)
+    stop_grace_period: 120s
+  
+    # ✅ AÑADIR: Healthcheck que falla después de X segundos
+    healthcheck:
+      test: ["CMD-SHELL", "exit 1"]  # Siempre falla = se detiene
+      interval: 60s                  # Chequea cada 60 segundos
+      timeout: 10s
+      retries: 1                     # Solo 1 retry = se detiene rápido
+      start_period: 120s             # ← Ejecuta durante 2 minutos y luego se detiene
+       
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================
+  # KAFDROP - Interfaz Web para Kafka
+  # ============================================================
+  # UI web para monitorear y gestionar Kafka visualmente
+  # Acceso: http://localhost:9000
+  # 
+  # Funcionalidades:
+  # - Ver topics y sus mensajes
+  # - Monitorear consumer groups y lag
+  # - Ver configuración de brokers
+  # - Buscar mensajes específicos
+  # ============================================================
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    container_name: kafdrop
+    hostname: kafdrop
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9000:9000"
+    environment:
+      KAFKA_BROKERCONNECT: kafka:9092
+      JVM_OPTS: "-Xms32M -Xmx64M"
+      SERVER_SERVLET_CONTEXTPATH: "/"
+    networks:
+      - kafka-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# ============================================================
+# REDES
+# ============================================================
 networks:
   kafka-net:
-    name: kafka-net # nombre fijo para compartir
+    name: kafka-net
     driver: bridge
 
-# Networks , servira como un puente de conexion entre los contenedores. 
+# ============================================================
+# CÓMO USAR ESTE ARCHIVO
+# ============================================================
+# 
+# 1. Levantar Kafka + Kafdrop (sin generador):
+#    docker-compose -f docker-compose-kafka.yml up -d zookeeper kafka kafdrop
+#
+# 2. Levantar mongo-persister (verás el warning de topic no disponible):
+#    docker-compose -f docker-compose-services.yml up -d mongo-persister
+#    docker logs -f mongo-persister
+#
+# 3. Levantar el generador (en otra terminal):
+#    docker-compose -f docker-compose-kafka.yml up -d random_generator
+#    docker logs -f random_generator
+#
+# 4. Acceder a Kafdrop:
+#    http://localhost:9000
+#
+# 5. El generador enviará ~100 mensajes y se detendrá automáticamente
+#
+# 6. Para generar más datos, reinicia el generador:
+#    docker-compose -f docker-compose-kafka.yml restart random_generator
+#
+# 7. Verificar mensajes en Kafka:
+#    docker exec kafka kafka-run-class kafka.tools.GetOffsetShell \
+#      --broker-list localhost:9092 --topic probando
+#
+# 8. Detener todo:
+#    docker-compose -f docker-compose-kafka.yml down
+#    docker-compose -f docker-compose-services.yml down
+#
+# 9. Limpiar volúmenes (borrar todos los datos):
+#    docker-compose -f docker-compose-kafka.yml down -v
+#    docker-compose -f docker-compose-services.yml down -v
+# ============================================================

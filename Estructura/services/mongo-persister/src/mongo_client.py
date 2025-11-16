@@ -7,7 +7,7 @@ from pymongo import MongoClient, errors
 from pymongo.collection import Collection
 from datetime import datetime
 from typing import Dict, List, Optional
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 

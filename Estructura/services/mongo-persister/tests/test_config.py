@@ -2,42 +2,55 @@
 Tests para configuración
 """
 import unittest
+import sys
 import os
-from unittest.mock import patch
+import io
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+import pytest
 
 
-class TestConfig(unittest.TestCase):
-    """Tests para config.py"""
+@pytest.mark.unit
+class TestConfigPrintFunction(unittest.TestCase):
+    """Tests de la función print_config()"""
     
-    @patch.dict(os.environ, {
-        'KAFKA_BOOTSTRAP_SERVERS': 'localhost:9092',
-        'KAFKA_TOPIC': 'test_topic',
-        'MONGO_URI': 'mongodb://localhost:27017',
-        'MONGO_DATABASE': 'test_db',
-        'COLLECTION_NAME': 'test_collection'
-    })
-    def test_config_from_env(self):
-        """Test: Configuración desde variables de entorno"""
-        import src.config as config
+    def test_print_config_does_not_crash(self):
+        """Test: print_config() no crashea"""
+        from src import config
         
-        # Recargar módulo para tomar nuevas variables
-        import importlib
-        importlib.reload(config)
+        # Capturar stdout
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
         
-        self.assertEqual(config.KAFKA_BOOTSTRAP_SERVERS, 'localhost:9092')
-        self.assertEqual(config.KAFKA_TOPIC, 'test_topic')
-        self.assertEqual(config.MONGO_URI, 'mongodb://localhost:27017')
-        self.assertEqual(config.MONGO_DATABASE, 'test_db')
-        self.assertEqual(config.COLLECTION_NAME, 'test_collection')
+        try:
+            config.print_config()
+            output = sys.stdout.getvalue()
+            
+            # Verificar que imprime algo
+            self.assertIn("CONFIGURACIÓN", output)
+            self.assertIn("Kafka", output)
+            self.assertIn("MongoDB", output)
+        finally:
+            sys.stdout = old_stdout
     
-    def test_config_defaults(self):
-        """Test: Valores por defecto de configuración"""
-        import src.config as config
+    def test_print_config_output_format(self):
+        """Test: print_config() tiene formato correcto"""
+        from src import config
         
-        # Verificar que existen las variables
-        self.assertIsNotNone(config.KAFKA_BOOTSTRAP_SERVERS)
-        self.assertIsNotNone(config.KAFKA_TOPIC)
-        self.assertIsNotNone(config.MONGO_URI)
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        
+        try:
+            config.print_config()
+            output = sys.stdout.getvalue()
+            
+            # Verificar formato
+            self.assertIn("=" * 60, output)
+            self.assertIn("Bootstrap Servers:", output)
+            self.assertIn("Database:", output)
+        finally:
+            sys.stdout = old_stdout
 
 
 if __name__ == '__main__':

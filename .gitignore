@@ -1,41 +1,105 @@
-# Python
+# ============================================================
+# PYTHON
+# ============================================================
 __pycache__/
 *.py[cod]
-*.pyc
-.pytest_cache/
-.coverage
 *$py.class
 *.so
 .Python
-env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+
+# ============================================================
+# VIRTUAL ENVIRONMENTS
+# ============================================================
 venv/
+ENV/
+env/
 .venv
 .env
 
-# IDEs
+# ============================================================
+# TESTING (NO SUBIR REPORTS AL REPO)
+# ============================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+.hypothesis/
+.tox/
+coverage.xml
+*.log
+test-results/
+junit.xml
+
+
+
+# ============================================================
+# IDE
+# ============================================================
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# Logs
-*.log
-logs/
+# ============================================================
+# OS
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# Data
+
+
+# ============================================================
+# DATABASES
+# ============================================================
+*.db
+*.sqlite
+*.sqlite3
+
+
+# ============================================================
+# KAFKA/MONGO LOCAL DATA
+# ============================================================
 data/
+logs/
+kafka-logs/
+zookeeper/
+mongo-data/
+
+
+# ============================================================
+# KAFKA/MONGO LOCAL DATA
+# ============================================================
+data/
+logs/
+*.log
+kafka-logs/
+zookeeper/
+mongo-data/
 *.csv
 *.parquet
 
-# Tests
-.coverage
-htmlcov/
-.pytest_cache/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Ignorar la carpeta de generación de datos
+# ============================================================
+# Ignorar la carpeta de generación de datos random
+# ============================================================
 Estructura/datagen/*
 !Estructura/datagen/__init__.py

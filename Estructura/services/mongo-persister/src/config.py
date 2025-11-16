@@ -4,6 +4,7 @@ Lee variables de entorno pasadas por Docker Compose
 """
 import os
 
+
 # ============================================================
 # CONFIGURACIÓN DE KAFKA
 # ============================================================

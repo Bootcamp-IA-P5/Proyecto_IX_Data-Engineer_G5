@@ -1,23 +1,12 @@
 """
-Data Processor - Agrupa y procesa datos crudos de MongoDB
-
-Responsabilidades (Issue #6):
-1. Leer mensajes crudos de raw_messages
-2. Agrupar por persona (Passport, Fullname, Address)
-3. Unificar 5 tipos de datos en 1 registro
-4. Validar integridad de datos
-5. Guardar en aggregated_data (MongoDB temporal)
-6. SQL Persister (Issue #8) se encargará de mover a SQL
+Data Processor - Agrupa 5 tipos de mensajes en un único registro por persona
 """
-import logging
-import signal
-import sys
 import time
-from collections import defaultdict
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-import config
-from mongo_client import get_mongo_client
+import logging
+from datetime import datetime
+from typing import Dict, Optional, List
+from . import config
+from .mongo_client import get_mongo_client
 
 # Configurar logging
 logging.basicConfig(
@@ -26,388 +15,449 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Control de cierre graceful
-shutdown_requested = False
 
+# ============================================================
+# DETECCIÓN DE TIPO DE MENSAJE
+# ============================================================
 
-def signal_handler(sig, frame):
-    """Maneja señales de cierre (Ctrl+C, SIGTERM)"""
-    global shutdown_requested
-    logger.info("🛑 Señal de cierre recibida. Finalizando...")
-    shutdown_requested = True
-
-
-class DataProcessor:
+def detect_message_type(message: Dict) -> str:
     """
-    Procesador de Datos - Agrupa información por persona
+    Detecta el tipo de mensaje basándose en los campos presentes
     
-    Estrategia de agrupación:
-    1. Lee documentos crudos (raw_messages)
-    2. Agrupa por passport (clave principal)
-    3. Unifica 5 tipos de datos:
-       - Personal Info
-       - Contact Info
-       - Address
-       - Employment
-       - Benefits
-    4. Valida que estén completos
-    5. Guarda en aggregated_data
+    Returns:
+        'personal' | 'location' | 'professional' | 'bank' | 'net' | 'unknown'
     """
+    fields = set(message.keys())
     
-    def __init__(self):
-        """Inicializa el procesador"""
-        self.mongo_client = None
-        self.stats = {
-            'total_processed': 0,
-            'total_grouped': 0,
-            'total_incomplete': 0,
-            'errors': 0,
-            'start_time': time.time()
-        }
-        # Buffer temporal para acumular datos por persona
-        self.person_buffer: Dict[str, Dict] = defaultdict(dict)
+    # Tipo 1: Personal Data (name, last_name, sex, telfnumber, passport, email)
+    if 'name' in fields and 'last_name' in fields:
+        return 'personal'
     
-    def setup(self):
-        """Configura conexión a MongoDB"""
-        logger.info("🚀 Iniciando Data Processor")
-        config.print_config()
-        
-        logger.info("📦 Conectando a MongoDB...")
-        self.mongo_client = get_mongo_client()
-        
-        logger.info("✅ Data Processor listo. Esperando datos...")
+    # Tipo 2: Location (fullname, city, address)
+    if 'city' in fields:
+        return 'location'
     
-    def validate_document(self, doc: Dict) -> bool:
-        """
-        Valida que un documento tenga estructura mínima
-        
-        Args:
-            doc: Documento a validar
-            
-        Returns:
-            True si es válido
-        """
-        # Campos obligatorios
-        required_fields = ['_kafka_metadata', '_inserted_at']
-        
-        for field in required_fields:
-            if field not in doc:
-                logger.warning(f"⚠️ Documento inválido: falta campo '{field}'")
-                return False
-        
-        return True
+    # Tipo 3: Professional Data (fullname, company, job)
+    if 'company' in fields and 'job' in fields:
+        return 'professional'
     
-    def extract_person_key(self, doc: Dict) -> Optional[str]:
-        """
-        Extrae clave única de la persona (passport)
-        
-        Args:
-            doc: Documento con datos
-            
-        Returns:
-            Passport de la persona o None
-        """
-        # TODO: Adaptar según estructura real de tus mensajes
-        # Por ahora asume que el campo 'passport' está en el root
-        passport = doc.get('passport')
-        
-        if not passport:
-            # Intentar extraer de otros campos
-            passport = doc.get('data', {}).get('passport')
-        
-        if not passport:
-            logger.warning(f"⚠️ Documento sin passport: {doc.get('_id')}")
-        
-        return passport
+    # Tipo 4: Bank Data (passport, IBAN, salary)
+    if 'IBAN' in fields and 'salary' in fields:
+        return 'bank'
     
-    def categorize_message(self, doc: Dict) -> Optional[str]:
-        """
-        Categoriza el tipo de mensaje
-        
-        Args:
-            doc: Documento con datos
-            
-        Returns:
-            Tipo de mensaje: 'personal', 'contact', 'address', 'employment', 'benefits'
-        """
-        # TODO: Adaptar según tu estructura de mensajes
-        # Ejemplo: si tienes un campo 'message_type' o 'event_type'
-        msg_type = doc.get('message_type') or doc.get('event_type')
-        
-        # Mapeo de tipos (adaptar según tus datos)
-        type_mapping = {
-            'personal_info': 'personal',
-            'contact_info': 'contact',
-            'address_info': 'address',
-            'employment_info': 'employment',
-            'benefits_info': 'benefits'
-        }
-        
-        return type_mapping.get(msg_type)
+    # Tipo 5: Net Data (address, IPv4)
+    if 'IPv4' in fields or 'ipv4' in fields:
+        return 'net'
     
-    def accumulate_person_data(self, doc: Dict):
-        """
-        Acumula datos de una persona en el buffer temporal
-        
-        Args:
-            doc: Documento con datos de un tipo específico
-        """
-        try:
-            # Extraer passport
-            passport = self.extract_person_key(doc)
-            if not passport:
-                self.stats['errors'] += 1
-                return
-            
-            # Categorizar mensaje
-            category = self.categorize_message(doc)
-            if not category:
-                logger.warning(f"⚠️ Tipo de mensaje no reconocido: {doc.get('message_type')}")
-                self.stats['errors'] += 1
-                return
-            
-            # Inicializar estructura de persona si no existe
-            if passport not in self.person_buffer:
-                self.person_buffer[passport] = {
-                    'passport': passport,
-                    'personal': None,
-                    'contact': None,
-                    'address': None,
-                    'employment': None,
-                    'benefits': None,
-                    'first_seen': datetime.utcnow(),
-                    'last_updated': datetime.utcnow(),
-                    'source_ids': []  # IDs de documentos crudos usados
-                }
-            
-            # Actualizar categoría específica
-            self.person_buffer[passport][category] = doc
-            self.person_buffer[passport]['last_updated'] = datetime.utcnow()
-            self.person_buffer[passport]['source_ids'].append(doc.get('_id'))
-            
-            logger.debug(f"📥 Acumulado: {passport} - {category}")
-            
-        except Exception as e:
-            logger.error(f"❌ Error acumulando datos: {e}")
-            self.stats['errors'] += 1
+    return 'unknown'
+
+
+# ============================================================
+# EXTRACCIÓN Y LIMPIEZA DE CAMPOS
+# ============================================================
+
+def clean_string(value) -> Optional[str]:
+    """Limpia y valida strings"""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return str(value).strip() if value else None
+
+
+def extract_passport(message: Dict) -> Optional[str]:
+    """Extrae y valida el passport del mensaje"""
+    passport = message.get('passport')
+    if passport:
+        passport = clean_string(passport)
+        # Validar formato básico (al menos 5 caracteres alfanuméricos)
+        if passport and len(passport) >= 5:
+            return passport
+    return None
+
+
+def extract_fullname(message: Dict) -> Optional[str]:
+    """
+    Extrae fullname del mensaje
+    Puede estar en 'fullname' o construirse de 'name' + 'last_name'
+    """
+    # Opción 1: Campo fullname directo
+    if 'fullname' in message:
+        return clean_string(message['fullname'])
     
-    def is_person_complete(self, person_data: Dict) -> bool:
-        """
-        Verifica si una persona tiene los 5 tipos de datos
-        
-        Args:
-            person_data: Diccionario con datos de la persona
-            
-        Returns:
-            True si tiene los 5 tipos completos
-        """
-        required_types = ['personal', 'contact', 'address', 'employment', 'benefits']
-        return all(person_data.get(t) is not None for t in required_types)
+    # Opción 2: Construir de name + last_name
+    name = clean_string(message.get('name'))
+    last_name = clean_string(message.get('last_name'))
     
-    def should_flush_person(self, person_data: Dict) -> bool:
-        """
-        Determina si se debe guardar una persona (completa o por timeout)
+    if name and last_name:
+        return f"{name} {last_name}"
+    elif name:
+        return name
+    elif last_name:
+        return last_name
+    
+    return None
+
+
+def extract_email(message: Dict) -> Optional[str]:
+    """Extrae y valida email"""
+    email = clean_string(message.get('email'))
+    if email and '@' in email:
+        return email.lower()
+    return None
+
+
+def extract_address(message: Dict) -> Optional[str]:
+    """Extrae address (normalizado)"""
+    address = clean_string(message.get('address'))
+    return address.lower() if address else None
+
+
+# ============================================================
+# GENERACIÓN DE CLAVES DE AGRUPACIÓN
+# ============================================================
+
+def generate_grouping_key(message: Dict) -> Optional[str]:
+    """
+    Genera clave única para agrupar mensajes de la misma persona
+    
+    Prioridad:
+    1. passport (más confiable)
+    2. email (único por persona)
+    3. fullname + address (combinación)
+    4. fullname solo (menos confiable)
+    5. FALLBACK: address sola (para Net Data sin otros identificadores)
+    
+    Returns:
+        Clave única o None si no se puede determinar
+    """
+    # Prioridad 1: Passport
+    passport = extract_passport(message)
+    if passport:
+        return f"passport:{passport}"
+    
+    # Prioridad 2: Email
+    email = extract_email(message)
+    if email:
+        return f"email:{email}"
+    
+    # Prioridad 3: Fullname + Address
+    fullname = extract_fullname(message)
+    address = extract_address(message)
+    
+    if fullname and address:
+        # Normalizar para agrupación
+        key = f"{fullname.lower()}|{address[:50]}"  # Limitar address a 50 chars
+        return f"name_addr:{key}"
+    
+    # Prioridad 4: Solo fullname (menos confiable)
+    if fullname:
+        return f"name:{fullname.lower()}"
+    
+    # Prioridad 5: FALLBACK - Solo address (para Net Data)
+    # Esto es arriesgado pero necesario para Net Data que viene sin identificadores
+    if address:
+        return f"addr:{address[:50]}"
+    
+    # No se puede agrupar
+    logger.warning(f"⚠️  No se pudo generar clave de agrupación para mensaje: {message.get('_id')}")
+    return None
+
+
+
+# ============================================================
+# PROCESAMIENTO DE CADA TIPO DE MENSAJE
+# ============================================================
+
+def process_personal_data(message: Dict) -> Dict:
+    """Procesa mensaje tipo Personal Data"""
+    return {
+        'name': clean_string(message.get('name')),
+        'last_name': clean_string(message.get('last_name')),
+        'sex': message.get('sex'),  # Ya es lista
+        'telfnumber': clean_string(message.get('telfnumber')),
+        'email': extract_email(message),
+        'passport': extract_passport(message),
+    }
+
+
+def process_location_data(message: Dict) -> Dict:
+    """Procesa mensaje tipo Location"""
+    return {
+        'fullname': extract_fullname(message),
+        'city': clean_string(message.get('city')),
+        'address': clean_string(message.get('address')),
+    }
+
+
+def process_professional_data(message: Dict) -> Dict:
+    """Procesa mensaje tipo Professional Data"""
+    return {
+        'company': clean_string(message.get('company')),
+        'company_address': clean_string(message.get('company address')),
+        'company_telfnumber': clean_string(message.get('company_telfnumber')),
+        'company_email': clean_string(message.get('company_email')),
+        'job': clean_string(message.get('job')),
+    }
+
+
+def process_bank_data(message: Dict) -> Dict:
+    """Procesa mensaje tipo Bank Data"""
+    return {
+        'passport': extract_passport(message),
+        'iban': clean_string(message.get('IBAN')),
+        'salary': clean_string(message.get('salary')),
+    }
+
+
+def process_net_data(message: Dict) -> Dict:
+    """Procesa mensaje tipo Net Data"""
+    # Manejar ambos casos: 'IPv4' o 'ipv4'
+    ipv4 = clean_string(message.get('IPv4') or message.get('ipv4'))
+    
+    return {
+        'ipv4': ipv4,
+        'net_address': clean_string(message.get('address')),
+    }
+
+
+# ============================================================
+# AGRUPACIÓN Y MERGE DE DATOS
+# ============================================================
+
+def merge_data(existing: Dict, new_data: Dict, msg_type: str) -> Dict:
+    """
+    Merge inteligente: solo actualiza campos que no existen o están vacíos
+    
+    Args:
+        existing: Datos existentes del documento agregado
+        new_data: Nuevos datos a incorporar
+        msg_type: Tipo de mensaje ('personal', 'location', etc.)
+    
+    Returns:
+        Documento actualizado
+    """
+    result = existing.copy()
+    
+    # Actualizar campos solo si no existen o están vacíos
+    for key, value in new_data.items():
+        if value is not None and value != '':
+            # Si el campo no existe o está vacío, actualizar
+            if key not in result or result[key] is None or result[key] == '':
+                result[key] = value
+            # Si existe pero es diferente, loguear inconsistencia
+            elif result[key] != value:
+                logger.debug(f"⚠️  Inconsistencia en '{key}': existe='{result[key]}', nuevo='{value}'")
+    
+    # Actualizar metadata
+    if 'types_received' not in result:
+        result['types_received'] = []
+    
+    if msg_type not in result['types_received']:
+        result['types_received'].append(msg_type)
+    
+    result['messages_count'] = result.get('messages_count', 0) + 1
+    result['last_updated'] = datetime.utcnow()
+    
+    # Verificar si está completo (tiene los 5 tipos)
+    result['is_complete'] = len(result['types_received']) == 5
+    
+    return result
+
+
+def process_message(message: Dict, mongo_client) -> bool:
+    """
+    Procesa un mensaje y lo agrega al registro correspondiente
+    
+    Args:
+        message: Mensaje raw de MongoDB
+        mongo_client: Cliente MongoDB
         
-        Args:
-            person_data: Datos de la persona
-            
-        Returns:
-            True si se debe guardar
-        """
-        # Si está completa, siempre flush
-        if self.is_person_complete(person_data):
-            return True
-        
-        # Si pasó el tiempo de ventana, flush aunque esté incompleta
-        elapsed = (datetime.utcnow() - person_data['first_seen']).total_seconds()
-        if elapsed > config.GROUPING_WINDOW:
-            logger.info(f"⏰ Timeout: guardando persona incompleta (passport: {person_data['passport']})")
-            return True
-        
+    Returns:
+        True si se procesó correctamente
+    """
+    # Detectar tipo
+    msg_type = detect_message_type(message)
+    
+    if msg_type == 'unknown':
+        logger.warning(f"⚠️  Mensaje desconocido: {message.get('_id')} - Campos: {list(message.keys())}")
         return False
     
-    def create_aggregated_document(self, person_data: Dict) -> Dict:
-        """
-        Crea documento agregado con validación de integridad
-        
-        Args:
-            person_data: Datos acumulados de la persona
-            
-        Returns:
-            Documento agregado listo para MongoDB
-        """
-        # Validar integridad
-        is_complete = self.is_person_complete(person_data)
-        
-        # Extraer datos limpios de cada categoría
-        aggregated = {
-            'passport': person_data['passport'],
-            'is_complete': is_complete,
-            'missing_data': [],
-            'processed_at': datetime.utcnow(),
-            'first_seen': person_data['first_seen'],
-            'last_updated': person_data['last_updated'],
-            'source_count': len(person_data['source_ids']),
-            'source_ids': person_data['source_ids']
-        }
-        
-        # Agregar cada tipo de dato
-        for data_type in ['personal', 'contact', 'address', 'employment', 'benefits']:
-            if person_data[data_type]:
-                aggregated[data_type] = person_data[data_type]
-            else:
-                aggregated['missing_data'].append(data_type)
-        
-        return aggregated
+    # Generar clave de agrupación
+    grouping_key = generate_grouping_key(message)
+    if not grouping_key:
+        return False
     
-    def flush_person_buffer(self):
-        """
-        Procesa personas del buffer que estén listas
-        """
-        passports_to_remove = []
-        
-        for passport, person_data in self.person_buffer.items():
-            if self.should_flush_person(person_data):
-                # Crear documento agregado
-                agg_doc = self.create_aggregated_document(person_data)
-                
-                # Guardar en MongoDB
-                if self.mongo_client.upsert_aggregated(agg_doc):
-                    self.stats['total_grouped'] += 1
-                    
-                    if not agg_doc['is_complete']:
-                        self.stats['total_incomplete'] += 1
-                        logger.info(
-                            f"⚠️ Persona incompleta guardada: {passport} "
-                            f"(falta: {', '.join(agg_doc['missing_data'])})"
-                        )
-                    else:
-                        logger.info(f"✅ Persona completa: {passport}")
-                    
-                    # Marcar documentos crudos como procesados
-                    self.mongo_client.mark_as_processed(person_data['source_ids'])
-                    
-                    # Preparar para eliminación del buffer
-                    passports_to_remove.append(passport)
-                else:
-                    self.stats['errors'] += 1
-        
-        # Limpiar buffer
-        for passport in passports_to_remove:
-            del self.person_buffer[passport]
+    # Procesar según tipo
+    processors = {
+        'personal': process_personal_data,
+        'location': process_location_data,
+        'professional': process_professional_data,
+        'bank': process_bank_data,
+        'net': process_net_data,
+    }
     
-    def process_batch(self):
-        """
-        Procesa un lote de documentos crudos
+    try:
+        new_data = processors[msg_type](message)
         
-        Flujo:
-        1. Lee BATCH_SIZE documentos de raw_messages
-        2. Valida cada documento
-        3. Acumula en buffer por persona
-        4. Flush personas completas o con timeout
-        """
-        try:
-            # Leer documentos sin procesar
-            logger.info(f"📥 Leyendo hasta {config.BATCH_SIZE} documentos crudos...")
-            docs = self.mongo_client.get_unprocessed_documents(config.BATCH_SIZE)
-            
-            if not docs:
-                logger.info("ℹ️  No hay documentos nuevos para procesar")
-                # Flush buffer por timeout
-                self.flush_person_buffer()
-                return
-            
-            logger.info(f"✅ Se encontraron {len(docs)} documentos para procesar")
-            
-            # Procesar cada documento
-            for doc in docs:
-                if self.validate_document(doc):
-                    self.accumulate_person_data(doc)
-                    self.stats['total_processed'] += 1
-                else:
-                    self.stats['errors'] += 1
-            
-            # Flush personas listas
-            self.flush_person_buffer()
-            
-        except Exception as e:
-            logger.error(f"❌ Error en process_batch: {e}")
-            self.stats['errors'] += 1
-    
-    def print_stats(self):
-        """Muestra estadísticas del procesador"""
-        elapsed = time.time() - self.stats['start_time']
-        rate = self.stats['total_processed'] / elapsed if elapsed > 0 else 0
+        # Obtener documento existente (si existe)
+        existing = mongo_client.aggregated_collection.find_one({'_grouping_key': grouping_key}) or {}
         
-        logger.info("=" * 60)
-        logger.info("📊 ESTADÍSTICAS DEL DATA PROCESSOR")
-        logger.info("=" * 60)
-        logger.info(f"Total procesados: {self.stats['total_processed']:,}")
-        logger.info(f"Personas agrupadas: {self.stats['total_grouped']:,}")
-        logger.info(f"Personas incompletas: {self.stats['total_incomplete']:,}")
-        logger.info(f"Errores: {self.stats['errors']}")
-        logger.info(f"En buffer: {len(self.person_buffer)}")
-        logger.info(f"Rate: {rate:.2f} mensajes/segundo")
-        logger.info(f"Tiempo: {elapsed:.2f} segundos")
+        # Merge de datos
+        merged = merge_data(existing, new_data, msg_type)
         
-        # Estadísticas de MongoDB
-        mongo_stats = self.mongo_client.get_stats()
-        logger.info(f"MongoDB raw_messages: {mongo_stats.get('raw_total', 0):,}")
-        logger.info(f"MongoDB pendientes: {mongo_stats.get('raw_pending', 0):,}")
-        logger.info(f"MongoDB agregados: {mongo_stats.get('aggregated_total', 0):,}")
-        logger.info("=" * 60)
-    
-    def run(self):
-        """Loop principal del procesador"""
-        try:
-            self.setup()
-            
-            last_stats_time = time.time()
-            
-            while not shutdown_requested:
-                # Procesar lote
-                self.process_batch()
-                
-                # Mostrar estadísticas periódicamente
-                if time.time() - last_stats_time >= config.STATS_INTERVAL:
-                    self.print_stats()
-                    last_stats_time = time.time()
-                
-                # Esperar antes del siguiente lote
-                logger.info(f"⏳ Esperando {config.PROCESSING_INTERVAL}s antes del siguiente lote...")
-                time.sleep(config.PROCESSING_INTERVAL)
-            
-            # Flush final
-            logger.info("🔄 Flush final de buffer...")
-            self.flush_person_buffer()
-            self.print_stats()
-            
-        except KeyboardInterrupt:
-            logger.info("⌨️  Interrupción por teclado")
-        except Exception as e:
-            logger.error(f"❌ Error en run(): {e}", exc_info=True)
-        finally:
-            self.cleanup()
-    
-    def cleanup(self):
-        """Limpia recursos antes de cerrar"""
-        logger.info("🧹 Limpiando recursos...")
+        # Asegurar que tiene la clave de agrupación
+        merged['_grouping_key'] = grouping_key
         
-        if self.mongo_client:
-            self.mongo_client.close()
+        # Extraer passport si está disponible (clave preferida)
+        if 'passport' in merged and merged['passport']:
+            merged['_main_key'] = f"passport:{merged['passport']}"
+        else:
+            merged['_main_key'] = grouping_key
         
-        logger.info("👋 Data Processor finalizado")
+        # Agregar ID del mensaje fuente
+        if 'source_message_ids' not in merged:
+            merged['source_message_ids'] = []
+        merged['source_message_ids'].append(str(message['_id']))
+        
+        # Guardar/actualizar
+        mongo_client.aggregated_collection.update_one(
+            {'_grouping_key': grouping_key},
+            {'$set': merged},
+            upsert=True
+        )
+        
+        logger.debug(f"✅ {msg_type.upper()}: {grouping_key}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error procesando {msg_type}: {e}")
+        return False
 
+
+# ============================================================
+# PROCESAMIENTO POR LOTES
+# ============================================================
+
+def process_batch(mongo_client) -> int:
+    """
+    Procesa un lote de mensajes
+    
+    Returns:
+        Cantidad de mensajes procesados
+    """
+    # Obtener mensajes sin procesar
+    messages = mongo_client.get_unprocessed_documents(config.BATCH_SIZE)
+    
+    if not messages:
+        return 0
+    
+    stats = {
+        'personal': 0,
+        'location': 0,
+        'professional': 0,
+        'bank': 0,
+        'net': 0,
+        'unknown': 0,
+        'errors': 0
+    }
+    
+    processed_ids = []
+    
+    for msg in messages:
+        msg_type = detect_message_type(msg)
+        
+        if process_message(msg, mongo_client):
+            stats[msg_type] += 1
+            processed_ids.append(msg['_id'])
+        else:
+            if msg_type == 'unknown':
+                stats['unknown'] += 1
+            else:
+                stats['errors'] += 1
+            # Marcar como procesado de todos modos para no bloquearse
+            processed_ids.append(msg['_id'])
+    
+    # Marcar como procesados
+    if processed_ids:
+        mongo_client.mark_as_processed(processed_ids)
+    
+    logger.info(
+        f"✅ Procesados {len(messages)} mensajes: "
+        f"Personal={stats['personal']}, Location={stats['location']}, "
+        f"Professional={stats['professional']}, Bank={stats['bank']}, "
+        f"Net={stats['net']}, Unknown={stats['unknown']}, Errors={stats['errors']}"
+    )
+    
+    return len(messages)
+
+
+# ============================================================
+# ESTADÍSTICAS
+# ============================================================
+
+def print_stats(mongo_client):
+    """Imprime estadísticas detalladas"""
+    stats = mongo_client.get_stats()
+    
+    logger.info("=" * 80)
+    logger.info("📊 ESTADÍSTICAS DE PROCESAMIENTO")
+    logger.info("=" * 80)
+    logger.info(f"Raw Messages:")
+    logger.info(f"  - Total: {stats.get('raw_total', 0):,}")
+    logger.info(f"  - Procesados: {stats.get('raw_processed', 0):,}")
+    logger.info(f"  - Pendientes: {stats.get('raw_pending', 0):,}")
+    logger.info(f"Datos Agregados:")
+    logger.info(f"  - Total personas: {stats.get('aggregated_total', 0):,}")
+    logger.info(f"  - Registros completos (5 tipos): {stats.get('aggregated_complete', 0):,}")
+    
+    # Calcular porcentaje de completitud
+    if stats.get('aggregated_total', 0) > 0:
+        completeness = (stats.get('aggregated_complete', 0) / stats.get('aggregated_total', 0)) * 100
+        logger.info(f"  - Completitud: {completeness:.2f}%")
+    
+    logger.info("=" * 80)
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
 def main():
-    """Punto de entrada principal"""
-    # Registrar handlers de señales
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    """Loop principal del procesador"""
+    logger.info("🚀 Iniciando Data Processor...")
+    config.print_config()
     
-    # Crear y ejecutar processor
-    processor = DataProcessor()
-    processor.run()
+    # Obtener cliente MongoDB
+    mongo_client = get_mongo_client()
+    
+    # Contador para estadísticas periódicas
+    batch_count = 0
+    
+    while True:
+        try:
+            processed = process_batch(mongo_client)
+            
+            if processed == 0:
+                logger.info(f"⏳ No hay mensajes. Esperando {config.POLL_INTERVAL}s...")
+                time.sleep(config.POLL_INTERVAL)
+            else:
+                batch_count += 1
+                time.sleep(1)
+                
+                # Mostrar estadísticas cada STATS_INTERVAL batches
+                if batch_count % config.STATS_INTERVAL == 0:
+                    print_stats(mongo_client)
+                
+        except KeyboardInterrupt:
+            logger.info("\n🛑 Deteniendo procesador...")
+            print_stats(mongo_client)
+            mongo_client.close()
+            break
+            
+        except Exception as e:
+            logger.error(f"❌ Error en loop principal: {e}", exc_info=True)
+            time.sleep(5)
 
 
 if __name__ == "__main__":

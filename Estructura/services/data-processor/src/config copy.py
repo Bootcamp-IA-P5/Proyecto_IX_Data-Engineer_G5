@@ -5,30 +5,20 @@ Lee variables de entorno pasadas por Docker Compose
 import os
 
 
-def get_env_int(key: str, default: int) -> int:
-    """Helper para obtener variables de entorno como int con manejo de errores"""
-    value = os.getenv(key)
-    if value is None or value == '':
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
 # ============================================================
 # CONFIGURACIÓN DE MONGODB
 # ============================================================
 MONGO_URI = os.getenv('MONGO_URI')
 MONGO_DATABASE = os.getenv('MONGO_DATABASE')
-MONGO_COLLECTION = os.getenv('MONGO_COLLECTION')  # raw_messages
-AGGREGATED_COLLECTION = os.getenv('AGGREGATED_COLLECTION', 'aggregated_data')
+MONGO_COLLECTION = os.getenv('MONGO_COLLECTION')
+AGGREGATED_COLLECTION = os.getenv('AGGREGATED_COLLECTION')
 
 # ============================================================
 # CONFIGURACIÓN DE PROCESAMIENTO
 # ============================================================
-BATCH_SIZE = get_env_int('BATCH_SIZE', 1000)
-POLL_INTERVAL = get_env_int('POLL_INTERVAL', 5)
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '1000'))
+PROCESSING_INTERVAL = int(os.getenv('PROCESSING_INTERVAL', '10'))
+GROUPING_WINDOW = int(os.getenv('GROUPING_WINDOW', '60'))
 
 # ============================================================
 # CONFIGURACIÓN DE LOGGING
@@ -39,7 +29,7 @@ LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 # ============================================================
 # CONFIGURACIÓN DE PERFORMANCE
 # ============================================================
-STATS_INTERVAL = get_env_int('STATS_INTERVAL', 10)
+STATS_INTERVAL = int(os.getenv('STATS_INTERVAL', '10'))
 
 
 def print_config():
@@ -50,6 +40,7 @@ def print_config():
     
     # Ocultar credenciales en la URI de MongoDB
     if MONGO_URI and '@' in MONGO_URI:
+        # Extraer solo host:port/
         mongo_display = MONGO_URI.split('@')[1]
         print(f"MongoDB URI: {mongo_display}")
     else:
@@ -59,7 +50,8 @@ def print_config():
     print(f"Colección origen: {MONGO_COLLECTION}")
     print(f"Colección destino: {AGGREGATED_COLLECTION}")
     print(f"Batch Size: {BATCH_SIZE}")
-    print(f"Poll Interval: {POLL_INTERVAL}s")
-    print(f"Stats Interval: {STATS_INTERVAL} batches")
+    print(f"Processing Interval: {PROCESSING_INTERVAL}s")
+    print(f"Grouping Window: {GROUPING_WINDOW}s")
+    print(f"Stats Interval: {STATS_INTERVAL}s")
     print(f"Log Level: {LOG_LEVEL}")
     print("=" * 60)

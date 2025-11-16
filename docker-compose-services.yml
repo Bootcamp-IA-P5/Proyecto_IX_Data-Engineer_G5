@@ -8,7 +8,7 @@
 # - sql-persister: Guarda datos en PostgreSQL (por implementar)
 # ============================================================
 
-version: '3.8'
+# version: '3.8'
 
 services:
 
@@ -167,20 +167,22 @@ services:
 
     container_name: data-processor
 
-    # Variables explícitas (como mongo-persister)
+    # Variables explícitas 
     environment:
       # MongoDB
+      # MongoDB (compartido)
       MONGO_URI: ${MONGO_URI}
       MONGO_DATABASE: ${MONGO_DATABASE}
-      RAW_COLLECTION: ${RAW_COLLECTION:-raw_messages}
-      AGGREGATED_COLLECTION: ${AGGREGATED_COLLECTION:-aggregated_data}
+      MONGO_COLLECTION: ${MONGO_COLLECTION}  # ← Lee la misma que mongo-persister
       
-      # Config de procesamiento
+      # Data Processor específico
+      AGGREGATED_COLLECTION: ${AGGREGATED_COLLECTION}
       BATCH_SIZE: ${BATCH_SIZE:-1000}
       PROCESSING_INTERVAL: ${PROCESSING_INTERVAL:-10}
       GROUPING_WINDOW: ${GROUPING_WINDOW:-60}
       STATS_INTERVAL: ${STATS_INTERVAL:-10}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      POLL_INTERVAL: ${POLL_INTERVAL}
     
     # Requiere MongoDB y mongo-persister
     depends_on:

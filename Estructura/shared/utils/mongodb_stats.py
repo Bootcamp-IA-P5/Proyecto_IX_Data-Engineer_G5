@@ -1,114 +1,111 @@
 """
 Estadísticas rápidas de MongoDB
 Útil para verificar el estado del sistema sin dashboard
+
+Obtiene estadísticas rápidas y globales de la base de datos MongoDB.
+Muestra el total de mensajes, procesados, pendientes, personas agregadas,
+completitud y distribución por tipo. Útil para auditoría y diagnóstico general.
+
 """
+import subprocess
+import json
 import sys
-from pathlib import Path
-from pymongo import MongoClient
 import os
-
-# Agregar el directorio raíz al path
-ROOT_DIR = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(ROOT_DIR))
-
 from dotenv import load_dotenv
 
-# Cargar .env
-load_dotenv(ROOT_DIR / '.env')
+# Cargar variables de entorno
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+load_dotenv(os.path.join(ROOT_DIR, '.env'))
 
-MONGO_USERNAME = os.getenv('MONGO_USERTEST')
-MONGO_PASSWORD = os.getenv('MONGO_PASSWORDTEST')
 MONGO_DATABASE = os.getenv('MONGO_DATABASE')
+MONGO_USER = os.getenv('MONGO_USERNAME')
+MONGO_PASS = os.getenv('MONGO_PASSWORD')
+MONGO_CONTAINER = os.getenv('MONGO_CONTAINER')
 
-# Probar diferentes configuraciones de URI
-URIS_TO_TRY = [
-    # Conectar directamente a la base de datos sin authSource
-    f"mongodb://{MONGO_USERNAME}:{MONGO_PASSWORD}@localhost:27017/{MONGO_DATABASE}",
-    # Con authSource igual a la base de datos
-    f"mongodb://{MONGO_USERNAME}:{MONGO_PASSWORD}@localhost:27017/{MONGO_DATABASE}?authSource={MONGO_DATABASE}",
-    # Sin especificar base de datos en la URI
-    f"mongodb://{MONGO_USERNAME}:{MONGO_PASSWORD}@localhost:27017/?authSource={MONGO_DATABASE}",
-]
+print("=" * 80)
+print(" " * 25 + "📊 ESTADÍSTICAS RÁPIDAS")
+print("=" * 80)
+print(f"\n🔌 Obteniendo datos de MongoDB (via docker exec con autenticación)...")
 
-
-def try_connect():
-    """Intenta conectar con diferentes URIs"""
-    for i, uri in enumerate(URIS_TO_TRY, 1):
-        try:
-            print(f"🔄 Intento {i}/3...", end=" ")
-            client = MongoClient(uri, serverSelectionTimeoutMS=3000)
-            # Probar acceso a la base de datos específica
-            db = client[MONGO_DATABASE]
-            db.command('ping')
-            print("✅")
-            return client
-        except Exception as e:
-            print(f"❌ {type(e).__name__}")
-            if i == len(URIS_TO_TRY):
-                raise e
-            continue
-    return None
-
-
-def main():
-    print("=" * 80)
-    print(" " * 25 + "📊 ESTADÍSTICAS RÁPIDAS")
-    print("=" * 80)
-    print(f"\n🔌 Conectando con usuario '{MONGO_USERNAME}' a base de datos '{MONGO_DATABASE}'...")
+try:
+    # Ejecutar consultas dentro del contenedor CON autenticación
+    result = subprocess.run([
+        'docker', 'exec', MONGO_CONTAINER, 'mongosh', MONGO_DATABASE,
+        '--username', MONGO_USER,
+        '--password', MONGO_PASS,
+        '--authenticationDatabase', 'admin',
+        '--quiet', '--eval',
+        '''
+        const data = {
+            raw_total: db.raw_messages.countDocuments({}),
+            raw_processed: db.raw_messages.countDocuments({processed: true}),
+            agg_total: db.aggregated_data.countDocuments({}),
+            agg_complete: db.aggregated_data.countDocuments({is_complete: true}),
+            types: db.aggregated_data.aggregate([
+                {$unwind: "$types_received"},
+                {$group: {_id: "$types_received", count: {$sum: 1}}},
+                {$sort: {_id: 1}}
+            ]).toArray()
+        };
+        print(JSON.stringify(data));
+        '''
+    ], capture_output=True, text=True, check=True, timeout=30)
     
-    try:
-        client = try_connect()
-        print("\n✅ Conexión exitosa")
-        
-        db = client[MONGO_DATABASE]
-        
-        # Raw Messages
-        raw_total = db.raw_messages.count_documents({})
-        raw_processed = db.raw_messages.count_documents({'processed': True})
-        raw_pending = raw_total - raw_processed
-        
-        print("\n📥 RAW MESSAGES:")
-        print(f"   Total:      {raw_total:,}")
-        print(f"   Procesados: {raw_processed:,} ({raw_processed/raw_total*100:.1f}%)" if raw_total > 0 else "   Procesados: 0 (0.0%)")
+    # Parsear resultado
+    output = result.stdout.strip()
+    data = json.loads(output)
+    
+    raw_total = data['raw_total']
+    raw_processed = data['raw_processed']
+    raw_pending = raw_total - raw_processed
+    agg_total = data['agg_total']
+    agg_complete = data['agg_complete']
+    
+    print("\n📥 RAW MESSAGES:")
+    print(f"   Total:      {raw_total:,}")
+    if raw_total > 0:
+        print(f"   Procesados: {raw_processed:,} ({raw_processed/raw_total*100:.1f}%)")
         print(f"   Pendientes: {raw_pending:,}")
-        
-        # Aggregated Data
-        agg_total = db.aggregated_data.count_documents({})
-        agg_complete = db.aggregated_data.count_documents({'is_complete': True})
-        
-        print("\n👥 DATOS AGREGADOS:")
-        print(f"   Total personas: {agg_total:,}")
-        print(f"   Completos (5 tipos): {agg_complete:,}")
-        
-        if agg_total > 0:
-            print(f"   Completitud: {agg_complete/agg_total*100:.2f}%")
-        
-        # Distribución de tipos
+    
+    print("\n👥 DATOS AGREGADOS:")
+    print(f"   Total personas: {agg_total:,}")
+    print(f"   Completos (5 tipos): {agg_complete:,}")
+    
+    if agg_total > 0:
+        print(f"   Completitud: {agg_complete/agg_total*100:.2f}%")
+    
+    # Distribución de tipos
+    if data['types']:
         print("\n📊 DISTRIBUCIÓN DE TIPOS:")
-        pipeline = [
-            {'$unwind': '$types_received'},
-            {'$group': {'_id': '$types_received', 'count': {'$sum': 1}}},
-            {'$sort': {'_id': 1}}
-        ]
+        type_icons = {
+            'bank': '💰',
+            'location': '📍',
+            'net': '🌐',
+            'personal': '👤',
+            'professional': '💼'
+        }
         
-        for doc in db.aggregated_data.aggregate(pipeline):
-            print(f"   {doc['_id']}: {doc['count']:,}")
-        
-        print("\n" + "=" * 80)
-        
-        client.close()
-        
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        print(f"\n💡 Detalles:")
-        print(f"   Username: {MONGO_USERNAME}")
-        print(f"   Database: {MONGO_DATABASE}")
-        print(f"\n🔧 Intentos realizados:")
-        print(f"   1. URI: mongodb://user:***@localhost:27017/{MONGO_DATABASE}")
-        print(f"   2. URI: mongodb://user:***@localhost:27017/{MONGO_DATABASE}?authSource={MONGO_DATABASE}")
-        print(f"   3. URI: mongodb://user:***@localhost:27017/?authSource={MONGO_DATABASE}")
-        exit(1)
-
-
-if __name__ == "__main__":
-    main()
+        for item in data['types']:
+            icon = type_icons.get(item['_id'], '📄')
+            print(f"   {icon} {item['_id']}: {item['count']:,}")
+    
+    print("\n" + "=" * 80)
+    
+except subprocess.TimeoutExpired:
+    print("❌ Timeout: La consulta tardó más de 30 segundos")
+    sys.exit(1)
+except subprocess.CalledProcessError as e:
+    print(f"❌ Error ejecutando mongosh:")
+    print(f"   Stderr: {e.stderr}")
+    print(f"   Stdout: {e.stdout}")
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"❌ Error parseando respuesta JSON: {e}")
+    print(f"   Output recibido:")
+    print(result.stdout)
+    sys.exit(1)
+except Exception as e:
+    print(f"❌ Error inesperado: {type(e).__name__}: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)

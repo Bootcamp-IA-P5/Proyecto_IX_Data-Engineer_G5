@@ -1,215 +1,148 @@
 """
 Dashboard de monitoreo del Data Processor
 Muestra estadísticas en tiempo real
+
+Monitoriza en tiempo real el estado del procesamiento de mensajes en MongoDB.
+Muestra estadísticas actualizadas, barra de progreso, velocidad de procesamiento,
+ETA estimado y distribución de tipos de datos agregados.
+Ideal para supervisar el avance del sistema y detectar cuellos de botella.
 """
+
 import os
 import sys
 import time
+import json
 from datetime import datetime
-from pymongo import MongoClient
-from pathlib import Path
-
-# Agregar el directorio raíz al path para imports
-ROOT_DIR = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(ROOT_DIR))
-
 from dotenv import load_dotenv
 
 # Cargar .env desde la raíz del proyecto
-load_dotenv(ROOT_DIR / '.env')
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+load_dotenv(os.path.join(ROOT_DIR, '.env'))
 
-# Configuración
-MONGO_USERNAME = os.getenv('MONGO_USERNAME', 'admin')
-MONGO_PASSWORD = os.getenv('MONGO_PASSWORD', 'admin123')
-MONGO_DATABASE = os.getenv('MONGO_DATABASE', 'hrpro_db')
-
-# Probar diferentes URIs
-URIS_TO_TRY = [
-    f"mongodb://{MONGO_USERNAME}:{MONGO_PASSWORD}@localhost:27017/{MONGO_DATABASE}?authSource=admin",
-    f"mongodb://{MONGO_USERNAME}:{MONGO_PASSWORD}@localhost:27017/admin",
-    f"mongodb://localhost:27017/",  # Sin auth
-]
-
-
-def try_connect():
-    """Intenta conectar con diferentes URIs"""
-    for uri in URIS_TO_TRY:
-        try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=2000)
-            client.admin.command('ping')
-            return client
-        except:
-            continue
-    return None
-
-
-# Conectar
-client = try_connect()
-if not client:
-    print("❌ No se pudo conectar a MongoDB")
-    print("Verifica que MongoDB esté ejecutándose: docker ps | grep mongo")
-    sys.exit(1)
-
-db = client[MONGO_DATABASE]
-
+MONGO_DATABASE = os.getenv('MONGO_DATABASE')
+MONGO_USER = os.getenv('MONGO_USERNAME')
+MONGO_PASS = os.getenv('MONGO_PASSWORD')
+MONGO_CONTAINER = os.getenv('MONGO_CONTAINER')
 
 def clear_screen():
-    """Limpia la pantalla"""
     os.system('cls' if os.name == 'nt' else 'clear')
 
-
 def get_stats():
-    """Obtiene estadísticas de las colecciones"""
-    raw_total = db.raw_messages.count_documents({})
-    raw_processed = db.raw_messages.count_documents({'processed': True})
-    raw_pending = raw_total - raw_processed
-    
-    agg_total = db.aggregated_data.count_documents({})
-    agg_complete = db.aggregated_data.count_documents({'is_complete': True})
-    
-    # Distribución de tipos recibidos
-    pipeline = [
-        {'$unwind': '$types_received'},
-        {'$group': {'_id': '$types_received', 'count': {'$sum': 1}}},
-        {'$sort': {'_id': 1}}
-    ]
-    type_dist = {doc['_id']: doc['count'] for doc in db.aggregated_data.aggregate(pipeline)}
-    
-    # Distribución de completitud
-    completeness_dist = {}
-    for i in range(1, 6):
-        count = db.aggregated_data.count_documents({'types_received': {'$size': i}})
-        if count > 0:
-            completeness_dist[i] = count
-    
-    return {
-        'raw_total': raw_total,
-        'raw_processed': raw_processed,
-        'raw_pending': raw_pending,
-        'agg_total': agg_total,
-        'agg_complete': agg_complete,
-        'type_dist': type_dist,
-        'completeness_dist': completeness_dist
-    }
-
-
-def format_number(n):
-    """Formatea números con separadores"""
-    return f"{n:,}"
-
-
-def calculate_eta(processed, total, elapsed_seconds):
-    """Calcula tiempo estimado restante"""
-    if processed == 0 or total == 0:
-        return "Calculando..."
-    
-    rate = processed / elapsed_seconds
-    remaining = total - processed
-    eta_seconds = remaining / rate if rate > 0 else 0
-    
-    hours = int(eta_seconds // 3600)
-    minutes = int((eta_seconds % 3600) // 60)
-    seconds = int(eta_seconds % 60)
-    
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-
-def print_dashboard(stats, start_time):
-    """Imprime el dashboard"""
-    clear_screen()
-    
-    elapsed = time.time() - start_time
-    
-    # Header
-    print("=" * 80)
-    print(" " * 20 + "📊 DATA PROCESSOR - DASHBOARD")
-    print("=" * 80)
-    print(f"Hora: {datetime.now().strftime('%H:%M:%S')} | Tiempo transcurrido: {int(elapsed)}s")
-    print("=" * 80)
-    
-    # Raw Messages
-    print("\n📥 RAW MESSAGES:")
-    print("-" * 80)
-    total = stats['raw_total']
-    processed = stats['raw_processed']
-    pending = stats['raw_pending']
-    progress_pct = (processed / total * 100) if total > 0 else 0
-    
-    print(f"  Total:      {format_number(total)}")
-    print(f"  Procesados: {format_number(processed)} ({progress_pct:.2f}%)")
-    print(f"  Pendientes: {format_number(pending)}")
-    
-    if total > 0:
-        # Barra de progreso
-        bar_width = 50
-        filled = int(bar_width * processed / total) if total > 0 else 0
-        bar = "█" * filled + "░" * (bar_width - filled)
-        print(f"\n  [{bar}] {progress_pct:.1f}%")
-        
-        # ETA
-        eta = calculate_eta(processed, total, elapsed)
-        rate = processed / elapsed if elapsed > 0 else 0
-        print(f"\n  Velocidad: {format_number(int(rate))} msg/s")
-        print(f"  ETA: {eta}")
-    else:
-        print("\n  ⚠️  No hay mensajes en la base de datos")
-    
-    # Aggregated Data
-    print("\n\n👥 DATOS AGREGADOS:")
-    print("-" * 80)
-    print(f"  Total personas: {format_number(stats['agg_total'])}")
-    print(f"  Completos (5 tipos): {format_number(stats['agg_complete'])}")
-    
-    if stats['agg_total'] > 0:
-        complete_pct = (stats['agg_complete'] / stats['agg_total']) * 100
-        print(f"  Completitud: {complete_pct:.2f}%")
-    
-    # Distribución de tipos
-    if stats['type_dist']:
-        print("\n  Distribución de tipos recibidos:")
-        type_names = {
-            'bank': '💰 Bank',
-            'location': '📍 Location',
-            'net': '🌐 Net',
-            'personal': '👤 Personal',
-            'professional': '💼 Professional'
-        }
-        
-        for type_key, count in sorted(stats['type_dist'].items()):
-            type_label = type_names.get(type_key, type_key)
-            print(f"    {type_label}: {format_number(count)}")
-    
-    # Distribución de completitud
-    if stats['completeness_dist']:
-        print("\n  Distribución de completitud:")
-        for num_types, count in sorted(stats['completeness_dist'].items()):
-            print(f"    {num_types} tipo(s): {format_number(count)} personas")
-    
-    print("\n" + "=" * 80)
-    print("Presiona Ctrl+C para salir")
-    print("=" * 80)
-
-
-def main():
-    """Loop principal del dashboard"""
-    print("🚀 Iniciando dashboard de monitoreo...")
-    print(f"📁 Directorio raíz: {ROOT_DIR}")
-    print("✅ Conectado a MongoDB")
-    print("Esperando 3 segundos...")
-    time.sleep(3)
-    
-    start_time = time.time()
-    
     try:
-        while True:
-            stats = get_stats()
-            print_dashboard(stats, start_time)
-            time.sleep(5)  # Actualizar cada 5 segundos
-            
-    except KeyboardInterrupt:
-        print("\n\n🛑 Dashboard detenido")
-        client.close()
+        result = os.popen(
+            f'docker exec {MONGO_CONTAINER} mongosh {MONGO_DATABASE} '
+            f'--username {MONGO_USER} --password {MONGO_PASS} --authenticationDatabase admin --quiet --eval "'
+            "const data = {"
+            "raw_total: db.raw_messages.countDocuments({}),"
+            "raw_processed: db.raw_messages.countDocuments({processed: true}),"
+            "agg_total: db.aggregated_data.countDocuments({}),"
+            "agg_complete: db.aggregated_data.countDocuments({is_complete: true}),"
+            "types: db.aggregated_data.aggregate(["
+            "{$unwind: '$types_received'},"
+            "{$group: {_id: '$types_received', count: {$sum: 1}}},"
+            "{$sort: {_id: 1}}"
+            "]).toArray()"
+            "};"
+            "print(JSON.stringify(data));"
+            '"'
+        ).read().strip()
+        return json.loads(result)
+    except Exception as e:
+        print(f"❌ Error obteniendo estadísticas: {e}")
+        return None
 
+def draw_progress_bar(percentage, width=50):
+    filled = int(width * percentage / 100)
+    bar = '█' * filled + '░' * (width - filled)
+    return f"[{bar}] {percentage:.1f}%"
 
-if __name__ == "__main__":
-    main()
+def format_time(seconds):
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds/60)}m {int(seconds%60)}s"
+    else:
+        hours = int(seconds / 3600)
+        minutes = int((seconds % 3600) / 60)
+        return f"{hours}h {minutes}m"
+
+print("🚀 Iniciando monitor de procesamiento...")
+print("   Presiona Ctrl+C para detener\n")
+
+previous_stats = None
+start_time = time.time()
+
+try:
+    while True:
+        stats = get_stats()
+        if stats is None:
+            time.sleep(5)
+            continue
+
+        clear_screen()
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print("=" * 80)
+        print(f"{'📊 MONITOR DE PROCESAMIENTO':^80}")
+        print(f"{'Actualizado: ' + current_time:^80}")
+        print("=" * 80)
+
+        raw_total = stats['raw_total']
+        raw_processed = stats['raw_processed']
+        raw_pending = raw_total - raw_processed
+        raw_percentage = (raw_processed / raw_total * 100) if raw_total > 0 else 0
+
+        print(f"\n📥 RAW MESSAGES:")
+        print(f"   Total:      {raw_total:>12,}")
+        print(f"   Procesados: {raw_processed:>12,}")
+        print(f"   Pendientes: {raw_pending:>12,}")
+        print(f"\n   {draw_progress_bar(raw_percentage)}")
+
+        if previous_stats:
+            processed_delta = raw_processed - previous_stats['raw_processed']
+            speed = processed_delta / 5
+            if speed > 0:
+                eta_seconds = raw_pending / speed
+                print(f"\n   ⚡ Velocidad: {speed:.1f} msg/s")
+                print(f"   ⏱️  ETA: {format_time(eta_seconds)}")
+
+        agg_total = stats['agg_total']
+        agg_complete = stats['agg_complete']
+        agg_percentage = (agg_complete / agg_total * 100) if agg_total > 0 else 0
+
+        print(f"\n👥 DATOS AGREGADOS:")
+        print(f"   Total personas:        {agg_total:>12,}")
+        print(f"   Registros completos:   {agg_complete:>12,}")
+        print(f"   Completitud:           {agg_percentage:>11.2f}%")
+
+        if stats['types']:
+            print(f"\n📊 DISTRIBUCIÓN DE TIPOS:")
+            type_icons = {
+                'bank': '💰',
+                'location': '📍',
+                'net': '🌐',
+                'personal': '👤',
+                'professional': '💼'
+            }
+            for item in stats['types']:
+                icon = type_icons.get(item['_id'], '📄')
+                count = item['count']
+                percentage = (count / agg_total * 100) if agg_total > 0 else 0
+                print(f"   {icon} {item['_id']:<12} {count:>12,}  ({percentage:>5.1f}%)")
+
+        elapsed = time.time() - start_time
+        print(f"\n{'─' * 80}")
+        print(f"   ⏱️  Tiempo de monitoreo: {format_time(elapsed)}")
+        print(f"   🔄 Próxima actualización en 5s...")
+        print("=" * 80)
+
+        previous_stats = stats
+        time.sleep(5)
+
+except KeyboardInterrupt:
+    print("\n\n✅ Monitor detenido por el usuario")
+    sys.exit(0)
+except Exception as e:
+    print(f"\n\n❌ Error inesperado: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)

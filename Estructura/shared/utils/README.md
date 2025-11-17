@@ -4,6 +4,14 @@ Scripts auxiliares para monitoreo, debugging y testing del sistema para el servi
 
 ## 📊 Scripts Disponibles
 
+
+### `menu_monitoring_data_processor.py`
+Menú interactivo para lanzar los principales scripts de monitorización y utilidades.
+
+```bash
+python Estructura/shared/utils/menu_monitoring_data_processor.py
+```
+
 ### `mongodb_stats.py`
 Muestra estadísticas rápidas de MongoDB.
 
@@ -50,6 +58,33 @@ python Estructura/shared/utils/check_messages.py
 
 ---
 
+### `analyze_distribution.py`
+Analiza la distribución de tipos agregados por persona y la completitud del matching.
+
+```bash
+python Estructura/shared/utils/analyze_distribution.py
+```
+
+**Muestra:**
+- Personas agrupadas por cantidad de tipos recibidos (1 a 5)
+- Completitud global del matching
+- Ejemplos de registros con 3, 4 y 5 tipos
+
+---
+
+### `test_connection.py`
+Testea la conexión a MongoDB usando distintas configuraciones y variables de entorno.
+
+```bash
+python Estructura/shared/utils/test_connection.py
+```
+
+**Características:**
+- Prueba varias formas de conexión (sin auth, con authSource, directConnection)
+- Diagnóstico de errores de red y autenticación
+
+---
+
 ### `reset_and_test.py`
 Resetea el sistema completo y genera datos de prueba.
 
@@ -64,7 +99,7 @@ python Estructura/shared/utils/reset_and_test.py
 2. Elimina volumen de MongoDB
 3. Reconstruye infraestructura
 4. Genera ~120k mensajes de prueba (2 minutos)
-5. Inicia el data-processor
+5. Inicia el data-processor y muestra estadísticas
 
 ---
 

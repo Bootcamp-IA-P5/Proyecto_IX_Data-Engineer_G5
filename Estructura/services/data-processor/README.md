@@ -298,6 +298,5 @@ Desde `Estructura/shared/utils/menu_monitoring_data-processor.py`:
 * El objetivo es **convergencia** a 5/5 de forma **natural**, sin “rellenos aleatorios”.
 * La heurística `professional` ayuda a cerrar 5/5 cuando hay evidencias ligeras (palabras clave/campos).
 
----
 
-**¿Listo para agregar con cariño y sin dolores?** 🚀
+

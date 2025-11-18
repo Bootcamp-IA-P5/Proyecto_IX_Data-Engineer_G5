@@ -1,9 +1,8 @@
 # 🛠️ Utilidades de Desarrollo
 
-Scripts auxiliares para monitoreo, debugging y testing del sistema para el servicio data-procesor (lee datos en crudo en MongoDB 'raw_messages' y los inserta en MongoDB en 'aggregated-data')
+Scripts auxiliares para monitoreo, debugging, gestión de contenedores y testing del sistema para el servicio data-processor (lee datos en crudo en MongoDB 'raw_messages' y los inserta en MongoDB en 'aggregated-data').
 
 ## 📊 Scripts Disponibles
-
 
 ### `menu_monitoring_data_processor.py`
 Menú interactivo para lanzar los principales scripts de monitorización y utilidades.
@@ -11,6 +10,28 @@ Menú interactivo para lanzar los principales scripts de monitorización y utili
 ```bash
 python Estructura/shared/utils/menu_monitoring_data_processor.py
 ```
+
+**Opciones destacadas:**
+- Ver estado de todos los contenedores Docker (servicio y contenedor real)
+- Parar/levantar contenedores individuales o en grupo (Kafka/servicios)
+- Reconstruir (build) contenedores
+- Ver logs en tiempo real de cualquier contenedor (Ctrl+C para salir)
+- Sugerencias automáticas para crear contenedores si no existen
+- Acceso directo a todos los scripts de monitorización
+
+---
+
+### `docker_management_menu.py`
+Submenú interactivo para gestión avanzada de contenedores Docker.
+
+**Opciones:**
+- Estado actual de todos los contenedores (servicio ↔ contenedor ↔ estado)
+- Parar/levantar todos los contenedores o por grupo
+- Parar/levantar/reconstruir contenedores individuales
+- Ver logs en tiempo real de cualquier contenedor
+- Sugerencias automáticas para crear contenedores con docker-compose si no existen
+
+---
 
 ### `mongodb_stats.py`
 Muestra estadísticas rápidas de MongoDB.
@@ -149,6 +170,25 @@ docker ps | grep mongo
 Ver logs:
 ```bash
 docker logs hrpro-mongodb
+```
+
+### Gestión y recreación de contenedores
+
+- Ver estado y logs de cualquier contenedor desde el menú interactivo.
+- Sugerencia automática para crear contenedores si no existen:
+  ```bash
+  docker-compose -f <compose-file> up -d <servicio>
+  ```
+- Forzar reconstrucción y recreación de contenedores:
+  ```bash
+  docker-compose -f <compose-file> build --no-cache <servicio>
+  docker-compose -f <compose-file> up -d --force-recreate <servicio>
+  ```
+
+### Limpiar recursos Docker
+
+```bash
+docker system prune -a
 ```
 
 ### Recrear todo el entorno

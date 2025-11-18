@@ -8,7 +8,7 @@
 # - sql-persister: Guarda datos en PostgreSQL (por implementar)
 # ============================================================
 
-version: '3.8'
+# version: '3.8'
 
 services:
 
@@ -104,25 +104,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-    # ----------------------------------------------------------
-    # DATA PROCESSOR (Por implementar)
-    # ----------------------------------------------------------
-    # Servicio que procesa y transforma los datos
-    # Aplica validaciones, limpieza y agregaciones
-    # ----------------------------------------------------------
-    # data-processor:
-    #   build:
-    #     context: ./Estructura/services/data-processor
-    #     dockerfile: Dockerfile
-    #   container_name: data-processor
-    #   env_file:
-    #     - ./Estructura/services/data-processor/.env
-    #   depends_on:
-    #     - kafka-consumer
-    #   networks:
-    #     - kafka-net
-    #   restart: unless-stopped
-
   # ----------------------------------------------------------
   # MONGO PERSISTER
   # ----------------------------------------------------------
@@ -166,6 +147,54 @@ services:
       - services-net
 
     restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ----------------------------------------------------------
+  # DATA PROCESSOR
+  # ----------------------------------------------------------
+  # Servicio que agrupa datos crudos de MongoDB (Issue #6)
+  # Lee raw_messages, agrupa por persona, guarda en aggregated_data
+  # ----------------------------------------------------------
+  data-processor:
+    build:
+      context: ./Estructura/services/data-processor
+      dockerfile: Dockerfile
+
+    container_name: data-processor
+
+    # Variables explícitas 
+    environment:
+      # MongoDB
+      # MongoDB (compartido)
+      MONGO_URI: ${MONGO_URI}
+      MONGO_DATABASE: ${MONGO_DATABASE}
+      MONGO_COLLECTION: ${MONGO_COLLECTION}  # ← Lee la misma que mongo-persister
+      
+      # Data Processor específico
+      AGGREGATED_COLLECTION: ${AGGREGATED_COLLECTION}
+      BATCH_SIZE: ${BATCH_SIZE:-1000}
+      PROCESSING_INTERVAL: ${PROCESSING_INTERVAL:-10}
+      GROUPING_WINDOW: ${GROUPING_WINDOW:-60}
+      STATS_INTERVAL: ${STATS_INTERVAL:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      POLL_INTERVAL: ${POLL_INTERVAL}
+    
+    # Requiere MongoDB y mongo-persister
+    depends_on:
+      - mongo
+        
+    # Red de servicios internos
+    networks:
+      - services-net
+
+    restart: unless-stopped
+
+    command: ["python", "-u", "-m", "src.processor"]
 
     logging:
       driver: "json-file"

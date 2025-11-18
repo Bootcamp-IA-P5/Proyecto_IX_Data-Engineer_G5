@@ -46,4 +46,4 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD ps aux | grep -v grep | grep persister.py || exit 1
 
 # Comando por defecto
-CMD ["python", "src/persister.py"]
+CMD ["python", "-m", "src.persister"]

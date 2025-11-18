@@ -103,3 +103,7 @@ mongo-data/
 # ============================================================
 Estructura/datagen/*
 !Estructura/datagen/__init__.py
+
+# Laboratorio local
+Estructura/services/data-processor/src/labo_*
+*.ipynb

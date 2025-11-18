@@ -10,6 +10,7 @@ import os
 import sys
 import subprocess
 from pathlib import Path
+from mongo_aggregated_tools import show_mongo_tools_menu
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
 UTILS_DIR = ROOT_DIR / "Estructura" / "shared" / "utils"
@@ -69,6 +70,11 @@ MENU_OPTIONS = [
         "key": "11",
         "desc": "🔄 Resetear y testear el sistema",
         "script": "reset_and_test.py"
+    },
+    {
+        "key": "12",
+        "desc": "🧰 Herramientas Mongo (aggregated_data / raw_messages)",
+        "mongo_tools": True
     },
     {
         "key": "q",
@@ -147,6 +153,9 @@ def main_menu():
             show_docker_status()
         elif selected.get("logs"):
             show_docker_logs()
+        elif selected.get("mongo_tools"):
+            # Nueva opción: abre el submenú de herramientas Mongo
+            show_mongo_tools_menu()
         elif selected["script"]:
             run_script(selected["script"])
         input("\nPresiona ENTER para volver al menú...")

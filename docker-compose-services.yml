@@ -187,13 +187,14 @@ services:
     # Requiere MongoDB y mongo-persister
     depends_on:
       - mongo
-      - mongo-persister
-
+        
     # Red de servicios internos
     networks:
       - services-net
 
     restart: unless-stopped
+
+    command: ["python", "-u", "-m", "src.processor"]
 
     logging:
       driver: "json-file"

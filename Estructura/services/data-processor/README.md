@@ -32,7 +32,7 @@ Copia `.env.example` a `.env` en la **raíz del repo** y revisa:
 
 ```env
 # Mongo
-MONGO_URI=mongodb://admin:admin123@mongo:27017/
+MONGO_URI=mongodb://<admin>:<passwd>@mongo:27017/
 MONGO_DATABASE=hrpro_db
 MONGO_COLLECTION=raw_messages
 AGGREGATED_COLLECTION=aggregated_data

@@ -270,7 +270,7 @@ class MongoPersister:
 ```
 PIX_G5_DataEngineer/
 ├── docker-compose-kafka.yml        # Kafka + Zookeeper + Kafdrop + Generator
-└── docker-compose-services.yml     # MongoDB + Mongo Express + Persister
+└── docker-compose-services.yml     # MongoDB + Mongo Express + MongoDB Persister + PostgresSQL (supabase)
 ```
 
 ### **Servicios por archivo:**
@@ -280,8 +280,8 @@ PIX_G5_DataEngineer/
 | ✅ zookeeper | ✅ hrpro-mongodb |
 | ✅ kafka | ✅ hrpro-mongo-viewer |
 | ✅ kafdrop | ✅ mongo-persister |
-| ✅ random_generator | |
-
+| ✅ random_generator | ✅ data-processor |
+|                     | ✅ sql-persister   |
 ---
 
 ## 🚀 Flujo de Arranque Completo
@@ -298,7 +298,7 @@ cd PIX_G5_DataEngineer
 docker-compose -f docker-compose-kafka.yml up -d zookeeper kafka kafdrop
 
 # Levantar MongoDB + Mongo Express
-docker-compose -f docker-compose-services.yml up -d hrpro-mongodb hrpro-mongo-viewer
+docker-compose -f docker-compose-services.yml up -d hrpro-mongodb hrpro-mongo-viewer mongo-persister data-processor sql-persister
 
 # Verificar que están corriendo
 docker ps

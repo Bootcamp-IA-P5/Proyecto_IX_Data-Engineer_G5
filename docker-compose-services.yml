@@ -202,23 +202,52 @@ services:
         max-size: "10m"
         max-file: "3"
 
-    # ----------------------------------------------------------
-    # SQL PERSISTER (Por implementar)
-    # ----------------------------------------------------------
-    # Servicio que guarda datos en PostgreSQL
-    # ----------------------------------------------------------
-    # sql-persister:
-    #   build:
-    #     context: ./Estructura/services/sql-persister
-    #     dockerfile: Dockerfile
-    #   container_name: sql-persister
-    #   env_file:
-    #     - ./Estructura/services/sql-persister/.env
-    #   depends_on:
-    #     - kafka-consumer
-    #   networks:
-    #     - kafka-net
-    #   restart: unless-stopped
+# ----------------------------------------------------------
+# SQL PERSISTER (Por implementar)
+# ----------------------------------------------------------
+# Servicio que guarda datos en PostgreSQL
+# ----------------------------------------------------------
+  sql-persister:
+    container_name: sql-persister
+    build:
+      context: ./Estructura/services/sql-persister
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      # Mongo (lee de aggregated_data)
+      - MONGO_URI=${MONGO_URI}
+      - MONGO_DATABASE=${MONGO_DATABASE}
+      - AGGREGATED_COLLECTION=${AGGREGATED_COLLECTION}
+      # Postgres (Supabase)
+      - PG_HOST=${PG_HOST}
+      - PG_PORT=${PG_PORT}
+      - PG_DATABASE=${PG_DATABASE}
+      - PG_USER=${PG_USER}
+      - PG_PASSWORD=${PG_PASSWORD}
+      - PG_SCHEMA=${PG_SCHEMA}
+      - PG_SSLMODE=${PG_SSLMODE}
+      - PG_POOL_MIN=${PG_POOL_MIN}
+      - PG_POOL_MAX=${PG_POOL_MAX}
+      - PG_CONNECT_TIMEOUT=${PG_CONNECT_TIMEOUT}
+      # Persister tuning
+      - SQL_BATCH_SIZE=${SQL_BATCH_SIZE}
+      - SQL_UPSERT_STRATEGY=${SQL_UPSERT_STRATEGY}
+      # Opcional: controla el pooling del cliente SQLAlchemy
+      - USE_SQLA_NULLPOOL=${USE_SQLA_NULLPOOL:-true}
+
+
+      # Usa el NOMBRE DEL SERVICIO de mongo en tu compose (suele ser "mongo").
+      # Si en tu compose se llama distinto, cámbialo aquí.
+      - mongo
+    
+    command: ["python", "-u", "-m", "src.sql-persister"]
+
+    # no expone puertos; solo hace ETL
+    networks:
+      - services-net
+
 
     # ============================================================
     # REDES
@@ -234,6 +263,8 @@ networks:
   services-net:
     driver: bridge
     name: services-net
+  
+  
 
 # ============================================================
 # VOLÚMENES

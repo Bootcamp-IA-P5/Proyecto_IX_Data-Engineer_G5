@@ -153,6 +153,8 @@ class MongoDBClient:
             _ensure_index(self.aggregated_collection, [("data.personal.email", 1)], name="idx_personal_email", sparse=True)
             _ensure_index(self.aggregated_collection, [("data.bank.iban", 1)], name="idx_bank_iban", sparse=True)
             _ensure_index(self.aggregated_collection, [("is_complete", 1)], name="idx_is_complete")
+            _ensure_index(self.aggregated_collection, [("is_complete", 1), ("updated_at", 1)], name="idx_complete_updated")
+
 
             logger.info("✅ Índices creados/verificados correctamente")
         except PyMongoError as e:

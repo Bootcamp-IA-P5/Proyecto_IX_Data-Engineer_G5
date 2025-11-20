@@ -1,727 +1,612 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-sql-persister.py
-----------------
-Persiste datos de MongoDB (colección "aggregated_data") en Postgres (Supabase) en modelo RELACIONAL
-(sin JSONB), con tablas: persons, personal, location, professional, bank, net.
+SQL Persister
+-------------
+Lee documentos "agregados" en MongoDB (colección aggregated_data),
+filtrando solo los que están COMPLETOS (tienen todos los tipos requeridos),
+y los vuelca en Postgres/Supabase con upserts idempotentes.
 
-Características:
-- Incremental por timestamp (updated_at por defecto) + filtro de personas COMPLETAS (5/5 tipos).
-- Upsert por persona (PK = person_id = _grouping_key de Mongo).
-- Integridad referencial (FKs desde tablas de detalle a persons).
-- RLS habilitado al arranque: SELECT para 'authenticated' y escritura para el rol del pooler (por defecto 'postgres').
-- Índice de Mongo asegurado: {is_complete:1, updated_at:1} para acelerar el incremental.
-- Control de frecuencia por SQL_POLL_SECONDS (fallback SLEEP_SECONDS_EMPTY).
-- Sin crear tablas extra (solo persons, personal, location, professional, bank, net).
+FIJOS EN ESTA VERSIÓN:
+- Checkpoint robusto con (updated_at, _id) para evitar perder docs cuando
+  hay empates de timestamp.
+- Índices Mongo creados solo donde procede (sin tocar _id).
+- Métricas de rendimiento por lote (tiempo y throughput).
+- DDL autocontenida: crea tablas si no existen e instala RLS básica
+  (SELECT para authenticated, ALL para postgres).
+- Tablas hijas usan JSONB para datos (flexible ante cambios de esquema).
 
-ENV esperadas (en .env):
-  # Mongo
-  MONGO_URI=mongodb://mongo:27017
-  MONGO_DATABASE=hrpro_db
-  AGGREGATED_COLLECTION=aggregated_data
-  AGGREGATED_TS_FIELD=updated_at
-
-  # Filtro de tipos requeridos (por defecto los 5)
-  REQUIRED_TYPES=personal,location,professional,bank,net
-
-  # Postgres (Supabase Pooler)
-  PG_USER=postgres
-  PG_PASSWORD=...
-  PG_HOST=aws-1-eu-west-1.pooler.supabase.com
-  PG_PORT=6543
-  PG_DATABASE=postgres
-  PG_SCHEMA=public
-  PG_SSLMODE=require
-  PG_POOL_MODE=session   # session|transaction|direct  (session/transaction => NullPool)
-
-  # Ciclo
-  SQL_POLL_SECONDS=2.0
-  SQL_BATCH_SIZE=1000
-  LOG_LEVEL=INFO          # DEBUG para más detalle
-
-  # RLS
-  ENABLE_RLS=1
-  RLS_READ_ROLE=authenticated
-  RLS_WRITER_ROLE=postgres
+ENV por defecto (ajusta según tu despliegue):
+- MONGO_URI=mongodb://mongo:27017/
+- MONGO_DB=hrpro_db
+- AGGREGATED_COLLECTION=aggregated_data
+- STATE_COLLECTION=sql_sync_state
+- REQUIRED_TYPES=personal,location,professional,bank,net
+- AGGREGATED_TS_FIELD=updated_at
+- AGGREGATED_GROUPING_FIELD=_grouping_key
+- SQL_POLL_SECONDS=2
+- SQL_BATCH_SIZE=1000
+- SQL_SKEW_SECONDS=0           # retroceder un poco el reloj para tolerar clocks
+- PG_HOST=aws-1-eu-west-1.pooler.supabase.com
+- PG_PORT=5432
+- PG_DATABASE=postgres
+- PG_USER=
+- PG_PASSWORD=
+- PG_SSLMODE=require
+- LOG_LEVEL=INFO
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sys
 import time
-import logging
-from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from dotenv import load_dotenv
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+import psycopg2
+from psycopg2.extras import execute_batch, Json
+from pymongo import ASCENDING, MongoClient
+from pymongo.collection import Collection
+from bson import ObjectId
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError, OperationalError
-from sqlalchemy.pool import NullPool
-
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Logging
-# =============================================================================
+# -----------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s - sql-persister - %(levelname)s - %(message)s",
+)
+log = logging.getLogger("sql-persister")
 
-def setup_logger() -> logging.Logger:
-    logger = logging.getLogger("sql-persister")
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logger.setLevel(getattr(logging, level, logging.INFO))
-    handler = logging.StreamHandler(sys.stdout)
-    fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    handler.setFormatter(fmt)
-    if not logger.handlers:
-        logger.addHandler(handler)
-    return logger
+# -----------------------------------------------------------------------------
+# Settings
+# -----------------------------------------------------------------------------
 
-log = setup_logger()
+def env_csv(name: str, default: str) -> List[str]:
+    raw = os.getenv(name, default)
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
-
-# =============================================================================
-# Utils entorno
-# =============================================================================
-
-def _env_first(*keys: str, default: Optional[str] = None) -> Optional[str]:
-    for k in keys:
-        v = os.getenv(k)
-        if v is not None and str(v).strip() != "":
-            return v
-        v = os.getenv(k.upper())
-        if v is not None and str(v).strip() != "":
-            return v
-        v = os.getenv(k.lower())
-        if v is not None and str(v).strip() != "":
-            return v
-    return default
-
-def load_settings() -> Dict[str, Any]:
-    load_dotenv()  # .env
-
-    st: Dict[str, Any] = {}
-
+settings: Dict[str, Any] = {
     # Mongo
-    st["MONGO_URI"] = _env_first("MONGO_URI", default="mongodb://mongo:27017")
-    st["MONGO_DATABASE"] = _env_first("MONGO_DATABASE", default="hrpro_db")
-    st["AGGREGATED_COLLECTION"] = _env_first("AGGREGATED_COLLECTION", default="aggregated_data")
-    st["AGGREGATED_TS_FIELD"] = _env_first("AGGREGATED_TS_FIELD", default="updated_at")
+    "MONGO_URI": os.getenv("MONGO_URI", "mongodb://mongo:27017/"),
+    "MONGO_DB": os.getenv("MONGO_DB", "hrpro_db"),
+    "AGGREGATED_COLLECTION": os.getenv("AGGREGATED_COLLECTION", "aggregated_data"),
+    "STATE_COLLECTION": os.getenv("STATE_COLLECTION", "sql_sync_state"),
 
-    # Requeridos
-    req = _env_first("REQUIRED_TYPES", default="personal,location,professional,bank,net")
-    st["REQUIRED_TYPES"] = [t.strip() for t in (req or "").split(",") if t.strip()]
+    # Gating y ordenación
+    "REQUIRED_TYPES": env_csv("REQUIRED_TYPES", "personal,location,professional,bank,net"),
+    "AGGREGATED_TS_FIELD": os.getenv("AGGREGATED_TS_FIELD", "updated_at"),
+    "GROUPING_FIELD": os.getenv("AGGREGATED_GROUPING_FIELD", "_grouping_key"),
+
+    # Batches / polling
+    "SQL_POLL_SECONDS": float(os.getenv("SQL_POLL_SECONDS", "2")),
+    "SQL_BATCH_SIZE": int(os.getenv("SQL_BATCH_SIZE", "1000")),
+    "SQL_SKEW_SECONDS": int(os.getenv("SQL_SKEW_SECONDS", "0")),
 
     # Postgres
-    st["PG_USER"] = _env_first("PG_USER", "user")
-    st["PG_PASSWORD"] = _env_first("PG_PASSWORD", "password")
-    st["PG_HOST"] = _env_first("PG_HOST", "host")
-    st["PG_PORT"] = int(_env_first("PG_PORT", "port", default="5432") or 5432)
-    st["PG_DATABASE"] = _env_first("PG_DATABASE", "dbname", default="postgres")
-    st["PG_SCHEMA"] = _env_first("PG_SCHEMA", default="public")
-    st["PG_SSLMODE"] = _env_first("PG_SSLMODE", default="require")
-    st["PG_POOL_MODE"] = (_env_first("PG_POOL_MODE", default="session") or "session").lower()
-    st["USE_SQLA_NULLPOOL"] = st["PG_POOL_MODE"] in ("transaction", "session")
+    "PG_HOST": os.getenv("PG_HOST", "aws-1-eu-west-1.pooler.supabase.com"),
+    "PG_PORT": int(os.getenv("PG_PORT", "5432")),
+    "PG_DATABASE": os.getenv("PG_DATABASE", "postgres"),
+    "PG_USER": os.getenv("PG_USER", ""),
+    "PG_PASSWORD": os.getenv("PG_PASSWORD", ""),
+    "PG_SSLMODE": os.getenv("PG_SSLMODE", "require"),
+}
 
-    # Ciclo
-    poll = _env_first("SQL_POLL_SECONDS", default=None)
-    if poll is None:
-        # compat con var vieja
-        poll = _env_first("SLEEP_SECONDS_EMPTY", default="2.0")
-    st["SQL_POLL_SECONDS"] = float(poll or 2.0)
-    st["SQL_BATCH_SIZE"] = int(_env_first("SQL_BATCH_SIZE", default="1000") or 1000)
+# -----------------------------------------------------------------------------
+# Utilidades
+# -----------------------------------------------------------------------------
 
-    # RLS
-    st["ENABLE_RLS"] = (_env_first("ENABLE_RLS", default="1") or "1").lower() not in ("0", "false", "no")
-    st["RLS_READ_ROLE"] = _env_first("RLS_READ_ROLE", default="authenticated")
-    st["RLS_WRITER_ROLE"] = _env_first("RLS_WRITER_ROLE", default="postgres")
-
-    # Validaciones Postgres
-    missing = [k for k in ("PG_USER", "PG_PASSWORD", "PG_HOST") if not st.get(k)]
-    if missing:
-        raise RuntimeError(f"Faltan variables obligatorias de Postgres: {missing}")
-
-    return st
+UTC = timezone.utc
 
 
-# =============================================================================
-# Conexiones
-# =============================================================================
-
-def build_pg_url(st: Dict[str, Any]) -> str:
-    return (
-        f"postgresql+psycopg2://{st['PG_USER']}:{st['PG_PASSWORD']}"
-        f"@{st['PG_HOST']}:{st['PG_PORT']}/{st['PG_DATABASE']}"
-        f"?sslmode={st['PG_SSLMODE']}"
-    )
-
-def make_pg_engine(st: Dict[str, Any]):
-    url = build_pg_url(st)
-    log.info("🔗 Postgres conectar | host=%s db=%s schema=%s pooler=%s|direct nullpool=%s",
-             st["PG_HOST"], st["PG_DATABASE"], st["PG_SCHEMA"], st["PG_POOL_MODE"], st["USE_SQLA_NULLPOOL"])
-    engine = create_engine(url, poolclass=NullPool, future=True) if st["USE_SQLA_NULLPOOL"] else create_engine(url, future=True)
-    with engine.connect() as conn:
-        conn.exec_driver_sql("select 1")
-        conn.exec_driver_sql(f"set search_path = {st['PG_SCHEMA']}, public")
-    log.info("✅ Postgres OK")
-    return engine
-
-def make_mongo(st: Dict[str, Any]) -> MongoClient:
-    log.info("🔗 MongoDB conectar…")
-    client = MongoClient(st["MONGO_URI"], serverSelectionTimeoutMS=5000)
-    client.admin.command("ping")
-    log.info("✅ Mongo OK | db=%s coll=%s", st["MONGO_DATABASE"], st["AGGREGATED_COLLECTION"])
-    return client
-
-
-# =============================================================================
-# Índices Mongo para acelerar el incremental
-# =============================================================================
-
-def ensure_mongo_indexes_for_persister(db, coll_name: str, ts_field: str):
+def ensure_tz(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if isinstance(dt, datetime):
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    # intentamos parsear ISO
     try:
-        db[coll_name].create_index(
-            [("is_complete", 1), (ts_field, 1)],
-            name="idx_complete_updated"
-        )
-        # opcional: si alguna vez consultas sólo por ts
-        # db[coll_name].create_index([(ts_field, 1)], name="idx_updated_only")
-    except Exception as e:
-        log.warning("⚠️ No se pudo asegurar índice Mongo idx_complete_updated: %s", e)
-
-
-# =============================================================================
-# DDL Postgres + RLS
-# =============================================================================
-
-DDL_SQL = """
--- PERSONS (maestra por persona)
-CREATE TABLE IF NOT EXISTS {schema}.persons (
-  person_id      TEXT PRIMARY KEY,
-  grouping_key   TEXT UNIQUE,
-  passport       TEXT,
-  email          TEXT,
-  phone          TEXT,
-  tax_id         TEXT,
-  ssn            TEXT,
-  created_at     TIMESTAMPTZ,
-  updated_at     TIMESTAMPTZ,
-  is_complete    BOOLEAN DEFAULT FALSE,
-  types_received TEXT[]
-);
-
--- Tablas por dominio (1:1 con persons)
-CREATE TABLE IF NOT EXISTS {schema}.personal (
-  person_id   TEXT PRIMARY KEY REFERENCES {schema}.persons(person_id) ON DELETE CASCADE,
-  fullname    TEXT,
-  first_name  TEXT,
-  last_name   TEXT,
-  name        TEXT,
-  surname     TEXT,
-  email       TEXT,
-  phone       TEXT,
-  dob         TEXT,
-  birthdate   TEXT
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.location (
-  person_id    TEXT PRIMARY KEY REFERENCES {schema}.persons(person_id) ON DELETE CASCADE,
-  address      TEXT,
-  street       TEXT,
-  city         TEXT,
-  state        TEXT,
-  province     TEXT,
-  postal_code  TEXT,
-  zip          TEXT,
-  country      TEXT,
-  lat          TEXT,
-  lon          TEXT,
-  latitude     TEXT,
-  longitude    TEXT
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.professional (
-  person_id        TEXT PRIMARY KEY REFERENCES {schema}.persons(person_id) ON DELETE CASCADE,
-  company          TEXT,
-  position         TEXT,
-  job_title        TEXT,
-  department       TEXT,
-  salary           TEXT,
-  contract_type    TEXT,
-  experience_years TEXT
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.bank (
-  person_id     TEXT PRIMARY KEY REFERENCES {schema}.persons(person_id) ON DELETE CASCADE,
-  iban          TEXT,
-  swift         TEXT,
-  bic           TEXT,
-  account_number TEXT,
-  bank_name     TEXT,
-  card_number   TEXT,
-  card_brand    TEXT,
-  card_exp      TEXT,
-  card_holder   TEXT
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.net (
-  person_id   TEXT PRIMARY KEY REFERENCES {schema}.persons(person_id) ON DELETE CASCADE,
-  ip          TEXT,
-  ipv4        TEXT,
-  ipv6        TEXT,
-  mac         TEXT,
-  hostname    TEXT,
-  domain      TEXT,
-  url         TEXT,
-  ssid        TEXT,
-  user_agent  TEXT,
-  browser     TEXT,
-  os          TEXT
-);
-
--- Índices útiles
-CREATE INDEX IF NOT EXISTS idx_persons_email    ON {schema}.persons(email);
-CREATE INDEX IF NOT EXISTS idx_persons_passport ON {schema}.persons(passport);
-CREATE INDEX IF NOT EXISTS idx_persons_updated  ON {schema}.persons(updated_at);
-"""
-
-RLS_ENABLE_SQL = """
--- Habilitar RLS en tablas
-ALTER TABLE {schema}.persons      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE {schema}.personal     ENABLE ROW LEVEL SECURITY;
-ALTER TABLE {schema}.location     ENABLE ROW LEVEL SECURITY;
-ALTER TABLE {schema}.professional ENABLE ROW LEVEL SECURITY;
-ALTER TABLE {schema}.bank         ENABLE ROW LEVEL SECURITY;
-ALTER TABLE {schema}.net          ENABLE ROW LEVEL SECURITY;
-
--- Política de lectura para 'authenticated'
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_policies
-    WHERE schemaname='{schema}' AND tablename='persons' AND policyname='read_authenticated'
-  ) THEN
-    CREATE POLICY read_authenticated ON {schema}.persons FOR SELECT TO {read_role} USING (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='personal' AND policyname='read_authenticated') THEN
-    CREATE POLICY read_authenticated ON {schema}.personal FOR SELECT TO {read_role} USING (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='location' AND policyname='read_authenticated') THEN
-    CREATE POLICY read_authenticated ON {schema}.location FOR SELECT TO {read_role} USING (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='professional' AND policyname='read_authenticated') THEN
-    CREATE POLICY read_authenticated ON {schema}.professional FOR SELECT TO {read_role} USING (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='bank' AND policyname='read_authenticated') THEN
-    CREATE POLICY read_authenticated ON {schema}.bank FOR SELECT TO {read_role} USING (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='net' AND policyname='read_authenticated') THEN
-    CREATE POLICY read_authenticated ON {schema}.net FOR SELECT TO {read_role} USING (true);
-  END IF;
-END $$;
-
--- Política de escritura para el rol del pooler (p.e. 'postgres')
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='persons' AND policyname='write_pooler') THEN
-    CREATE POLICY write_pooler ON {schema}.persons FOR ALL TO {write_role} USING (true) WITH CHECK (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='personal' AND policyname='write_pooler') THEN
-    CREATE POLICY write_pooler ON {schema}.personal FOR ALL TO {write_role} USING (true) WITH CHECK (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='location' AND policyname='write_pooler') THEN
-    CREATE POLICY write_pooler ON {schema}.location FOR ALL TO {write_role} USING (true) WITH CHECK (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='professional' AND policyname='write_pooler') THEN
-    CREATE POLICY write_pooler ON {schema}.professional FOR ALL TO {write_role} USING (true) WITH CHECK (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='bank' AND policyname='write_pooler') THEN
-    CREATE POLICY write_pooler ON {schema}.bank FOR ALL TO {write_role} USING (true) WITH CHECK (true);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='{schema}' AND tablename='net' AND policyname='write_pooler') THEN
-    CREATE POLICY write_pooler ON {schema}.net FOR ALL TO {write_role} USING (true) WITH CHECK (true);
-  END IF;
-END $$;
-"""
-
-def ensure_pg_schema_tables_rls(engine, schema: str, enable_rls: bool, read_role: str, write_role: str):
-    with engine.begin() as conn:
-        conn.exec_driver_sql(DDL_SQL.format(schema=schema))
-        if enable_rls:
-            conn.exec_driver_sql(RLS_ENABLE_SQL.format(schema=schema, read_role=read_role, write_role=write_role))
-    log.info("🧱 DDL ok (schema/tablas/índices%s)",
-             " y RLS asegurados" if enable_rls else "")
-
-
-# =============================================================================
-# Extract (Mongo)
-# =============================================================================
-
-def project_fields() -> Dict[str, int]:
-    # Solo traemos lo necesario
-    return {
-        "_id": 1,
-        "_grouping_key": 1,
-        "identifiers": 1,
-        "types_received": 1,
-        "is_complete": 1,
-        "created_at": 1,
-        "updated_at": 1,
-        "data.personal": 1,
-        "data.location": 1,
-        "data.professional": 1,
-        "data.bank": 1,
-        "data.net": 1,
-    }
-
-def fetch_incremental_complete(db, coll_name: str, ts_field: str, since: Optional[datetime],
-                               required_types: List[str], limit: int) -> Tuple[List[Dict[str, Any]], Optional[datetime]]:
-    """
-    Devuelve documentos de personas COMPLETAS (is_complete:true y types_received contiene todos required_types),
-    con updated_at > since (si since no es None). Orden ascendente por ts_field.
-    """
-    filt: Dict[str, Any] = {
-        "is_complete": True,
-        "types_received": {"$all": required_types},
-    }
-    if since is not None:
-        filt[ts_field] = {"$gt": since}
-
-    cur = (
-        db[coll_name]
-        .find(filt, project_fields())
-        .sort(ts_field, 1)
-        .limit(limit)
-    )
-    docs = list(cur)
-
-    max_ts = None
-    for d in docs:
-        ts = d.get(ts_field)
-        if isinstance(ts, datetime):
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if max_ts is None or ts > max_ts:
-                max_ts = ts
-
-    return docs, max_ts
-
-
-# =============================================================================
-# Transform helpers
-# =============================================================================
-
-def _s(val: Any) -> Optional[str]:
-    """A texto o None (solo almacenamos strings en tablas de dominio)."""
-    if val is None:
-        return None
-    return str(val)
-
-def flatten_person(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Fila para persons."""
-    person_id = doc.get("_grouping_key") or str(doc.get("_id"))
-    identifiers = doc.get("identifiers", {}) or {}
-    types = doc.get("types_received", []) or []
-
-    created_at = doc.get("created_at")
-    updated_at = doc.get("updated_at")
-
-    # normaliza a aware UTC
-    if isinstance(created_at, datetime) and created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
-    if isinstance(updated_at, datetime) and updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=timezone.utc)
-
-    return {
-        "person_id": person_id,
-        "grouping_key": _s(doc.get("_grouping_key")),
-        "passport": _s(identifiers.get("passport")),
-        "email": _s(identifiers.get("email")),
-        "phone": _s(identifiers.get("phone")),
-        "tax_id": _s(identifiers.get("tax_id")),
-        "ssn": _s(identifiers.get("ssn")),
-        "created_at": created_at,
-        "updated_at": updated_at,
-        "is_complete": True,
-        "types_received": types,
-    }
-
-def flatten_block(doc: Dict[str, Any], kind: str) -> Optional[Dict[str, Any]]:
-    data = (doc.get("data") or {}).get(kind) or {}
-    if not isinstance(data, dict):
-        return None
-    person_id = doc.get("_grouping_key") or str(doc.get("_id"))
-
-    if kind == "personal":
-        return {
-            "person_id": person_id,
-            "fullname": _s(data.get("fullname")),
-            "first_name": _s(data.get("first_name")),
-            "last_name": _s(data.get("last_name")),
-            "name": _s(data.get("name")),
-            "surname": _s(data.get("surname")),
-            "email": _s(data.get("email")),
-            "phone": _s(data.get("phone")),
-            "dob": _s(data.get("dob")),
-            "birthdate": _s(data.get("birthdate")),
-        }
-    if kind == "location":
-        return {
-            "person_id": person_id,
-            "address": _s(data.get("address")),
-            "street": _s(data.get("street")),
-            "city": _s(data.get("city")),
-            "state": _s(data.get("state")),
-            "province": _s(data.get("province")),
-            "postal_code": _s(data.get("postal_code")),
-            "zip": _s(data.get("zip")),
-            "country": _s(data.get("country")),
-            "lat": _s(data.get("lat")),
-            "lon": _s(data.get("lon")),
-            "latitude": _s(data.get("latitude")),
-            "longitude": _s(data.get("longitude")),
-        }
-    if kind == "professional":
-        return {
-            "person_id": person_id,
-            "company": _s(data.get("company")),
-            "position": _s(data.get("position")),
-            "job_title": _s(data.get("job_title")),
-            "department": _s(data.get("department")),
-            "salary": _s(data.get("salary")),
-            "contract_type": _s(data.get("contract_type")),
-            "experience_years": _s(data.get("experience_years")),
-        }
-    if kind == "bank":
-        return {
-            "person_id": person_id,
-            "iban": _s(data.get("iban")),
-            "swift": _s(data.get("swift")),
-            "bic": _s(data.get("bic")),
-            "account_number": _s(data.get("account_number")),
-            "bank_name": _s(data.get("bank_name")),
-            "card_number": _s(data.get("card_number")),
-            "card_brand": _s(data.get("card_brand")),
-            "card_exp": _s(data.get("card_exp")),
-            "card_holder": _s(data.get("card_holder")),
-        }
-    if kind == "net":
-        return {
-            "person_id": person_id,
-            "ip": _s(data.get("ip")),
-            "ipv4": _s(data.get("ipv4")),
-            "ipv6": _s(data.get("ipv6")),
-            "mac": _s(data.get("mac")),
-            "hostname": _s(data.get("hostname")),
-            "domain": _s(data.get("domain")),
-            "url": _s(data.get("url")),
-            "ssid": _s(data.get("ssid")),
-            "user_agent": _s(data.get("user_agent")),
-            "browser": _s(data.get("browser")),
-            "os": _s(data.get("os")),
-        }
-    return None
-
-
-# =============================================================================
-# Load (Postgres) - upserts
-# =============================================================================
-
-def upsert_persons(conn, schema: str, rows: List[Dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-    sql = text(f"""
-        INSERT INTO {schema}.persons
-          (person_id, grouping_key, passport, email, phone, tax_id, ssn,
-           created_at, updated_at, is_complete, types_received)
-        VALUES
-          (:person_id, :grouping_key, :passport, :email, :phone, :tax_id, :ssn,
-           :created_at, :updated_at, :is_complete, :types_received)
-        ON CONFLICT (person_id) DO UPDATE SET
-          grouping_key = EXCLUDED.grouping_key,
-          passport = EXCLUDED.passport,
-          email = EXCLUDED.email,
-          phone = EXCLUDED.phone,
-          tax_id = EXCLUDED.tax_id,
-          ssn = EXCLUDED.ssn,
-          created_at = COALESCE({schema}.persons.created_at, EXCLUDED.created_at),
-          updated_at = EXCLUDED.updated_at,
-          is_complete = EXCLUDED.is_complete,
-          types_received = EXCLUDED.types_received
-    """)
-    conn.execute(sql, rows)
-    return len(rows)
-
-def upsert_block(conn, schema: str, table: str, pk: str, cols: List[str], rows: List[Dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-    col_list = ", ".join(cols)
-    params = ", ".join([f":{c}" for c in cols])
-    update = ", ".join([f"{c}=EXCLUDED.{c}" for c in cols if c != pk])
-    sql = text(f"""
-        INSERT INTO {schema}.{table} ({col_list})
-        VALUES ({params})
-        ON CONFLICT ({pk}) DO UPDATE SET
-          {update}
-    """)
-    conn.execute(sql, rows)
-    return len(rows)
-
-
-# =============================================================================
-# Estado incremental en Mongo (colección de estado)
-# =============================================================================
-
-STATE_COLL = "_sql_sync_state"
-
-def get_last_ts(db, ts_field: str) -> Optional[datetime]:
-    doc = db.get_collection(STATE_COLL).find_one({"_id": "last_ts"})
-    if not doc:
-        return None
-    val = doc.get("value")
-    if isinstance(val, datetime):
-        return val
-    try:
-        return datetime.fromisoformat(str(val))
+        x = datetime.fromisoformat(str(dt))
+        return x if x.tzinfo else x.replace(tzinfo=UTC)
     except Exception:
         return None
 
-def set_last_ts(db, ts: datetime):
-    db.get_collection(STATE_COLL).update_one(
-        {"_id": "last_ts"},
-        {"$set": {"value": ts.isoformat()}},
-        upsert=True
+
+# -----------------------------------------------------------------------------
+# Conexiones
+# -----------------------------------------------------------------------------
+
+def mongo_connect() -> Tuple[MongoClient, Collection, Collection]:
+    log.info("🔗 MongoDB conectar…")
+    mc = MongoClient(settings["MONGO_URI"], tz_aware=True)
+    db = mc[settings["MONGO_DB"]]
+    agg = db[settings["AGGREGATED_COLLECTION"]]
+    state = db[settings["STATE_COLLECTION"]]
+
+    # Índices en aggregated_data
+    try:
+        agg.create_index([(settings["GROUPING_FIELD"], ASCENDING)], name="idx_grouping_key", background=True)
+        agg.create_index([(settings["AGGREGATED_TS_FIELD"], ASCENDING)], name="idx_updated_at", background=True)
+        agg.create_index(
+            [(settings["GROUPING_FIELD"], ASCENDING), (settings["AGGREGATED_TS_FIELD"], ASCENDING)],
+            name="idx_grouping_updated",
+            background=True,
+        )
+        log.debug("Índices Mongo verificados/creados")
+    except Exception as e:
+        log.warning("No se pudieron crear índices Mongo: %s", e)
+
+    # No crear índice en _id (Mongo ya lo tiene y da error si se fuerza opciones)
+    return mc, agg, state
+
+
+def pg_connect():
+    log.info(
+        "🔗 Postgres conectar | host=%s db=%s sslmode=%s",
+        settings["PG_HOST"], settings["PG_DATABASE"], settings["PG_SSLMODE"],
+    )
+    conn = psycopg2.connect(
+        host=settings["PG_HOST"],
+        port=settings["PG_PORT"],
+        dbname=settings["PG_DATABASE"],
+        user=settings["PG_USER"],
+        password=settings["PG_PASSWORD"],
+        sslmode=settings["PG_SSLMODE"],
+    )
+    conn.autocommit = False
+    log.info("✅ Postgres OK")
+    return conn
+
+
+# -----------------------------------------------------------------------------
+# Checkpoint (ts, _id)
+# -----------------------------------------------------------------------------
+
+def get_checkpoint(state_col: Collection) -> Tuple[Optional[datetime], Optional[str]]:
+    doc = state_col.find_one({"_id": "checkpoint"})
+    if not doc:
+        return None, None
+    ts = ensure_tz(doc.get("ts"))
+    last_id = doc.get("last_id")
+    return ts, last_id
+
+
+def set_checkpoint(state_col: Collection, ts: Optional[datetime], last_id: Optional[str]) -> None:
+    state_col.update_one(
+        {"_id": "checkpoint"},
+        {"$set": {"ts": ts.isoformat() if ts else None, "last_id": last_id}},
+        upsert=True,
     )
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Fetch batch
+# -----------------------------------------------------------------------------
+
+def fetch_batch(
+    agg: Collection,
+    since_ts: Optional[datetime],
+    since_id: Optional[str],
+    limit: int,
+    required_types: Iterable[str],
+    ts_field: str,
+) -> List[Dict[str, Any]]:
+    filt: Dict[str, Any] = {"types_received": {"$all": list(required_types)}}
+
+    if since_ts is not None:
+        # Filtro robusto: (ts > last_ts) OR (ts == last_ts AND _id > last_id)
+        or_cond: List[Dict[str, Any]] = [{ts_field: {"$gt": since_ts}}]
+        if since_id:
+            try:
+                or_cond.append({ts_field: since_ts, "_id": {"$gt": ObjectId(since_id)}})
+            except Exception:
+                or_cond.append({ts_field: since_ts})
+        else:
+            or_cond.append({ts_field: since_ts})
+        filt["$or"] = or_cond
+
+    cur = (
+        agg.find(filt)
+        .sort([(ts_field, 1), ("_id", 1)])
+        .limit(limit)
+    )
+
+    return list(cur)
+
+
+# -----------------------------------------------------------------------------
+# DDL y RLS en Postgres
+# -----------------------------------------------------------------------------
+
+DDL_SQL = r"""
+CREATE TABLE IF NOT EXISTS public.persons (
+  grouping_key TEXT PRIMARY KEY,
+  passport     TEXT,
+  email        TEXT,
+  phone        TEXT,
+  tax_id       TEXT,
+  ssn          TEXT,
+  created_at   TIMESTAMPTZ,
+  updated_at   TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS public.personal_data (
+  grouping_key TEXT PRIMARY KEY REFERENCES public.persons(grouping_key) ON DELETE CASCADE,
+  data         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at   TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS public.location_data (
+  grouping_key TEXT PRIMARY KEY REFERENCES public.persons(grouping_key) ON DELETE CASCADE,
+  data         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at   TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS public.professional_data (
+  grouping_key TEXT PRIMARY KEY REFERENCES public.persons(grouping_key) ON DELETE CASCADE,
+  data         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at   TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS public.bank_data (
+  grouping_key TEXT PRIMARY KEY REFERENCES public.persons(grouping_key) ON DELETE CASCADE,
+  data         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at   TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS public.net_data (
+  grouping_key TEXT PRIMARY KEY REFERENCES public.persons(grouping_key) ON DELETE CASCADE,
+  data         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at   TIMESTAMPTZ
+);
+
+-- Índices útiles
+CREATE INDEX IF NOT EXISTS idx_persons_updated_at      ON public.persons(updated_at);
+CREATE INDEX IF NOT EXISTS idx_personal_data_updated   ON public.personal_data(updated_at);
+CREATE INDEX IF NOT EXISTS idx_location_data_updated   ON public.location_data(updated_at);
+CREATE INDEX IF NOT EXISTS idx_professional_data_updated ON public.professional_data(updated_at);
+CREATE INDEX IF NOT EXISTS idx_bank_data_updated       ON public.bank_data(updated_at);
+CREATE INDEX IF NOT EXISTS idx_net_data_updated        ON public.net_data(updated_at);
+"""
+
+RLS_SQL = r"""
+DO $$ BEGIN
+  EXECUTE 'ALTER TABLE public.persons ENABLE ROW LEVEL SECURITY';
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'persons_select_authenticated') THEN
+    CREATE POLICY persons_select_authenticated ON public.persons
+      FOR SELECT TO authenticated USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'persons_all_postgres') THEN
+    CREATE POLICY persons_all_postgres ON public.persons
+      FOR ALL TO postgres USING (true) WITH CHECK (true);
+  END IF;
+
+  EXECUTE 'ALTER TABLE public.personal_data ENABLE ROW LEVEL SECURITY';
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'personal_select_authenticated') THEN
+    CREATE POLICY personal_select_authenticated ON public.personal_data
+      FOR SELECT TO authenticated USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'personal_all_postgres') THEN
+    CREATE POLICY personal_all_postgres ON public.personal_data
+      FOR ALL TO postgres USING (true) WITH CHECK (true);
+  END IF;
+
+  EXECUTE 'ALTER TABLE public.location_data ENABLE ROW LEVEL SECURITY';
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'location_select_authenticated') THEN
+    CREATE POLICY location_select_authenticated ON public.location_data
+      FOR SELECT TO authenticated USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'location_all_postgres') THEN
+    CREATE POLICY location_all_postgres ON public.location_data
+      FOR ALL TO postgres USING (true) WITH CHECK (true);
+  END IF;
+
+  EXECUTE 'ALTER TABLE public.professional_data ENABLE ROW LEVEL SECURITY';
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'professional_select_authenticated') THEN
+    CREATE POLICY professional_select_authenticated ON public.professional_data
+      FOR SELECT TO authenticated USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'professional_all_postgres') THEN
+    CREATE POLICY professional_all_postgres ON public.professional_data
+      FOR ALL TO postgres USING (true) WITH CHECK (true);
+  END IF;
+
+  EXECUTE 'ALTER TABLE public.bank_data ENABLE ROW LEVEL SECURITY';
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'bank_select_authenticated') THEN
+    CREATE POLICY bank_select_authenticated ON public.bank_data
+      FOR SELECT TO authenticated USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'bank_all_postgres') THEN
+    CREATE POLICY bank_all_postgres ON public.bank_data
+      FOR ALL TO postgres USING (true) WITH CHECK (true);
+  END IF;
+
+  EXECUTE 'ALTER TABLE public.net_data ENABLE ROW LEVEL SECURITY';
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'net_select_authenticated') THEN
+    CREATE POLICY net_select_authenticated ON public.net_data
+      FOR SELECT TO authenticated USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE polname = 'net_all_postgres') THEN
+    CREATE POLICY net_all_postgres ON public.net_data
+      FOR ALL TO postgres USING (true) WITH CHECK (true);
+  END IF;
+END $$;
+"""
+
+
+def ensure_tables_and_rls(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(DDL_SQL)
+        conn.commit()
+    # RLS puede fallar si el rol no tiene permisos → lo registramos pero no abortamos
+    try:
+        with conn.cursor() as cur:
+            cur.execute(RLS_SQL)
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        log.warning("RLS no aplicada (permiso/entorno): %s", e)
+
+
+# -----------------------------------------------------------------------------
+# Extracción de campos
+# -----------------------------------------------------------------------------
+
+def _get_grouping_key(doc: Dict[str, Any]) -> Optional[str]:
+    for k in (settings["GROUPING_FIELD"], "grouping_key", "id", "_id"):
+        v = doc.get(k)
+        if v:
+            return str(v)
+    return None
+
+
+def _get_identifiers(doc: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    ident = doc.get("identifiers", {}) or {}
+    return {
+        "passport": (ident.get("passport") or doc.get("passport")) or None,
+        "email": (ident.get("email") or doc.get("email")) or None,
+        "phone": (ident.get("phone") or doc.get("phone")) or None,
+        "tax_id": (ident.get("tax_id") or doc.get("tax_id")) or None,
+        "ssn": (ident.get("ssn") or doc.get("ssn")) or None,
+    }
+
+
+def _get_payload(doc: Dict[str, Any], name: str) -> Any:
+    payloads = doc.get("payloads") or {}
+    v = payloads.get(name)
+    if v is None:
+        v = doc.get(name)
+    return v
+
+
+def _is_empty_payload(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, (str, bytes)):
+        return len(v) == 0
+    if isinstance(v, dict):
+        # dict vacío o todos sus valores vacíos
+        return all(_is_empty_payload(x) for x in v.values()) if v else True
+    if isinstance(v, list):
+        return all(_is_empty_payload(x) for x in v) if v else True
+    return False
+
+
+# -----------------------------------------------------------------------------
+# Upsert en Postgres
+# -----------------------------------------------------------------------------
+
+PERSONS_SQL = (
+    """
+    INSERT INTO public.persons (
+        grouping_key, passport, email, phone, tax_id, ssn, created_at, updated_at
+    ) VALUES (%(grouping_key)s, %(passport)s, %(email)s, %(phone)s, %(tax_id)s, %(ssn)s, %(created_at)s, %(updated_at)s)
+    ON CONFLICT (grouping_key) DO UPDATE SET
+      passport   = EXCLUDED.passport,
+      email      = EXCLUDED.email,
+      phone      = EXCLUDED.phone,
+      tax_id     = EXCLUDED.tax_id,
+      ssn        = EXCLUDED.ssn,
+      created_at = COALESCE(public.persons.created_at, EXCLUDED.created_at),
+      updated_at = EXCLUDED.updated_at
+    """
+)
+
+CHILD_SQL_TMPL = (
+    """
+    INSERT INTO {table} (
+        grouping_key, data, updated_at
+    ) VALUES (%(grouping_key)s, %(data)s, %(updated_at)s)
+    ON CONFLICT (grouping_key) DO UPDATE SET
+      data      = EXCLUDED.data,
+      updated_at = EXCLUDED.updated_at
+    """
+)
+
+CHILD_TABLES = {
+    "personal": "public.personal_data",
+    "location": "public.location_data",
+    "professional": "public.professional_data",
+    "bank": "public.bank_data",
+    "net": "public.net_data",
+}
+
+
+def upsert_batch_pg(conn, docs: List[Dict[str, Any]], ts_field: str) -> Tuple[int, Dict[str, int], Optional[datetime]]:
+    counts = {"persons": 0, "personal": 0, "location": 0, "professional": 0, "bank": 0, "net": 0}
+    total = 0
+    max_ts: Optional[datetime] = None
+
+    persons_rows: List[Dict[str, Any]] = []
+    child_rows: Dict[str, List[Dict[str, Any]]] = {k: [] for k in CHILD_TABLES}
+
+    for d in docs:
+        grouping_key = _get_grouping_key(d)
+        if not grouping_key:
+            continue  # sin clave agrupadora, no volcamos
+
+        created_at = ensure_tz(d.get("created_at"))
+        updated_at = ensure_tz(d.get(ts_field))
+        if updated_at is None:
+            # si falta, usamos ahora para no dejar nulo
+            updated_at = datetime.now(tz=UTC)
+        if created_at is None:
+            created_at = updated_at
+
+        if (max_ts is None) or (updated_at > max_ts):
+            max_ts = updated_at
+
+        ident = _get_identifiers(d)
+        persons_rows.append(
+            {
+                "grouping_key": grouping_key,
+                "passport": ident.get("passport"),
+                "email": ident.get("email"),
+                "phone": ident.get("phone"),
+                "tax_id": ident.get("tax_id"),
+                "ssn": ident.get("ssn"),
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }
+        )
+
+        # Hijas (si hay payloads no vacíos)
+        for name in CHILD_TABLES:
+            payload = _get_payload(d, name)
+            if _is_empty_payload(payload):
+                continue
+            child_rows[name].append(
+                {
+                    "grouping_key": grouping_key,
+                    "data": Json(payload),
+                    "updated_at": updated_at,
+                }
+            )
+
+    with conn.cursor() as cur:
+        # persons
+        if persons_rows:
+            execute_batch(cur, PERSONS_SQL, persons_rows, page_size=1000)
+            counts["persons"] += len(persons_rows)
+            total += len(persons_rows)
+
+        # hijas
+        for name, rows in child_rows.items():
+            if not rows:
+                continue
+            sql = CHILD_SQL_TMPL.format(table=CHILD_TABLES[name])
+            execute_batch(cur, sql, rows, page_size=1000)
+            counts[name] += len(rows)
+            total += len(rows)
+
+    conn.commit()
+    return total, counts, max_ts
+
+
+# -----------------------------------------------------------------------------
 # Main loop
-# =============================================================================
+# -----------------------------------------------------------------------------
 
-def main():
-    settings = load_settings()
-
-    log.info("🚀 Iniciando SQL Persister | poll=%.1fs batch=%d req_types=%s",
-             settings["SQL_POLL_SECONDS"], settings["SQL_BATCH_SIZE"], ",".join(settings["REQUIRED_TYPES"]))
-
-    # Conexiones
-    mongo = make_mongo(settings)
-    db = mongo[settings["MONGO_DATABASE"]]
-    ensure_mongo_indexes_for_persister(db, settings["AGGREGATED_COLLECTION"], settings["AGGREGATED_TS_FIELD"])
-
-    engine = make_pg_engine(settings)
-    ensure_pg_schema_tables_rls(
-        engine,
-        schema=settings["PG_SCHEMA"],
-        enable_rls=settings["ENABLE_RLS"],
-        read_role=settings["RLS_READ_ROLE"],
-        write_role=settings["RLS_WRITER_ROLE"],
+def main() -> None:
+    req_types = settings["REQUIRED_TYPES"]
+    log.info(
+        "🚀 Iniciando SQL Persister | poll=%.1fs batch=%d req_types=%s",
+        settings["SQL_POLL_SECONDS"], settings["SQL_BATCH_SIZE"], ",".join(req_types)
     )
+
+    mc, agg, state = mongo_connect()
+
+    # Conexión a Postgres (si falla, registramos y reintentamos)
+    conn: Optional[psycopg2.extensions.connection] = None
+    while conn is None:
+        try:
+            conn = pg_connect()
+        except Exception as e:
+            log.error("❌ No se pudo conectar a Postgres: %s", e)
+            time.sleep(3)
+
+    ensure_tables_and_rls(conn)
 
     ts_field = settings["AGGREGATED_TS_FIELD"]
-    batch = settings["SQL_BATCH_SIZE"]
-    sleep_s = settings["SQL_POLL_SECONDS"]
-    required = settings["REQUIRED_TYPES"]
 
     while True:
         try:
-            last_ts = get_last_ts(db, ts_field)
-            docs, max_ts = fetch_incremental_complete(
-                db, settings["AGGREGATED_COLLECTION"], ts_field, last_ts, required, batch
+            last_ts, last_id = get_checkpoint(state)
+
+            # tolerancia a relojes (opcional)
+            skew = int(settings["SQL_SKEW_SECONDS"]) or 0
+            query_ts = last_ts
+            query_id = last_id
+            if last_ts and skew > 0:
+                query_ts = last_ts - timedelta(seconds=skew)
+                query_id = None  # al retroceder, reiniciamos desempate para ese ts
+
+            docs = fetch_batch(
+                agg,
+                query_ts,
+                query_id,
+                settings["SQL_BATCH_SIZE"],
+                req_types,
+                ts_field,
             )
 
             if not docs:
-                log.debug("⏳ Sin novedades (>= %s). Dormimos %.1fs", last_ts, sleep_s)
-                time.sleep(sleep_s)
+                msg_ts = last_ts.isoformat() if last_ts else "None"
+                log.info("⏳ Sin novedades (>= %s). Dormimos %.1fs", msg_ts, settings["SQL_POLL_SECONDS"])
+                time.sleep(settings["SQL_POLL_SECONDS"])
                 continue
 
-            # Transform
-            persons_rows: List[Dict[str, Any]] = []
-            personal_rows: List[Dict[str, Any]] = []
-            location_rows: List[Dict[str, Any]] = []
-            professional_rows: List[Dict[str, Any]] = []
-            bank_rows: List[Dict[str, Any]] = []
-            net_rows: List[Dict[str, Any]] = []
+            tic = time.perf_counter()
+            total, counts, max_ts = upsert_batch_pg(conn, docs, ts_field)
+            toc = time.perf_counter()
+            dur = toc - tic
+            rps = (total / dur) if dur > 0 else float(total)
 
-            for d in docs:
-                persons_rows.append(flatten_person(d))
+            # Avanzamos checkpoint al ÚLTIMO documento del lote (ordenado por ts,_id)
+            last_doc = docs[-1]
+            new_ts = ensure_tz(last_doc.get(ts_field)) or max_ts
+            new_last_id = str(last_doc.get("_id")) if last_doc.get("_id") is not None else None
+            set_checkpoint(state, new_ts, new_last_id)
 
-                pb = flatten_block(d, "personal")
-                if pb: personal_rows.append(pb)
+            log.info(
+                "✅ Lote Postgres: persons=%d | pers=%d loc=%d prof=%d bank=%d net=%d | filas=%d | ⏱️ %.3fs ~%.1f filas/s | checkpoint=%s / %s",
+                counts["persons"], counts["personal"], counts["location"], counts["professional"], counts["bank"], counts["net"],
+                total, dur, rps,
+                new_ts.isoformat() if new_ts else None, new_last_id,
+            )
 
-                lb = flatten_block(d, "location")
-                if lb: location_rows.append(lb)
+        except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
+            log.error("❌ Error de conexión Postgres: %s", e)
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+            conn = None
+            # reintento
+            while conn is None:
+                try:
+                    conn = pg_connect()
+                    ensure_tables_and_rls(conn)
+                except Exception as e2:
+                    log.error("❌ Reintento Postgres fallido: %s", e2)
+                    time.sleep(3)
 
-                prb = flatten_block(d, "professional")
-                if prb: professional_rows.append(prb)
-
-                bb = flatten_block(d, "bank")
-                if bb: bank_rows.append(bb)
-
-                nb = flatten_block(d, "net")
-                if nb: net_rows.append(nb)
-
-            # Load
-            with engine.begin() as conn:
-                n_persons = upsert_persons(conn, settings["PG_SCHEMA"], persons_rows)
-                n_pers = upsert_block(conn, settings["PG_SCHEMA"], "personal", "person_id",
-                                      ["person_id","fullname","first_name","last_name","name","surname","email","phone","dob","birthdate"],
-                                      personal_rows)
-                n_loc = upsert_block(conn, settings["PG_SCHEMA"], "location", "person_id",
-                                     ["person_id","address","street","city","state","province","postal_code","zip","country","lat","lon","latitude","longitude"],
-                                     location_rows)
-                n_prof = upsert_block(conn, settings["PG_SCHEMA"], "professional", "person_id",
-                                      ["person_id","company","position","job_title","department","salary","contract_type","experience_years"],
-                                      professional_rows)
-                n_bank = upsert_block(conn, settings["PG_SCHEMA"], "bank", "person_id",
-                                      ["person_id","iban","swift","bic","account_number","bank_name","card_number","card_brand","card_exp","card_holder"],
-                                      bank_rows)
-                n_net = upsert_block(conn, settings["PG_SCHEMA"], "net", "person_id",
-                                     ["person_id","ip","ipv4","ipv6","mac","hostname","domain","url","ssid","user_agent","browser","os"],
-                                     net_rows)
-
-            # checkpoint
-            if max_ts:
-                set_last_ts(db, max_ts)
-
-            log.info("✅ Lote Postgres: persons=%d | pers=%d loc=%d prof=%d bank=%d net=%d | checkpoint=%s",
-                     len(persons_rows), n_pers, n_loc, n_prof, n_bank, n_net,
-                     max_ts.isoformat() if max_ts else None)
-
-        except (SQLAlchemyError, PyMongoError) as e:
-            log.error("❌ Error en ciclo ETL: %s", str(e).strip())
-            time.sleep(max(2.0, sleep_s))
         except KeyboardInterrupt:
-            log.info("🛑 Interrumpido por el usuario.")
+            log.info("🛑 Señal de cierre recibida. Finalizando…")
             break
         except Exception as e:
-            log.exception("❌ Error inesperado: %s", e)
-            time.sleep(max(2.0, sleep_s))
+            log.exception("❌ Error ETL: %s", e)
+            time.sleep(2)
 
+    try:
+        if conn:
+            conn.close()
+        mc.close()
+    except Exception:
+        pass
+    log.info("👋 SQL Persister finalizado")
 
-# =============================================================================
-# Entrypoint
-# =============================================================================
 
 if __name__ == "__main__":
-    try:
-        main()
-    except OperationalError as e:
-        log.error("❌ Error fatal de conexión a Postgres: %s", str(e).strip())
-        sys.exit(2)
-    except Exception as e:
-        log.exception("❌ Falló la ejecución principal: %s", e)
-        sys.exit(3)
+    main()

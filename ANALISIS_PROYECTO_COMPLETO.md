@@ -3,14 +3,13 @@
 
 ---
 
-## 🏗️ ESTRUCTURA ACTUAL DEL PROYECTO
+## 🏗️ ESTRUCTURA DEL PROYECTO
 
 ```
 Proyecto_IX_Data-Engineer_G5/
 │
-├── 📄 docker-compose-kafka.yml          # ✅ Infraestructura Kafka
-├── 📄 docker-compose-services.yml       # ✅ Servicios aplicación (configurado)
-├── 📄 docker-compose-kafka-comentado.yml # 📝 Versión con comentarios detallados
+├── 📄 docker-compose-kafka.yml          # ✅ Infraestructura Kafka  (dockerizados F5)
+├── 📄 docker-compose-services.yml       # ✅ Servicios procesos ETL (dockerizados)
 ├── 📄 README.md                         # 📚 Documentación principal
 ├── 📄 .env.example                      # 🔧 Ejemplo de configuración
 │
@@ -26,20 +25,26 @@ Proyecto_IX_Data-Engineer_G5/
     │   │   ├── .env                     # ✅ Configuración (KAFKA_BOOTSTRAP_SERVERS=kafka:9092)
     │   │   ├── .env.example
     │   │   ├── requirements.txt         # ✅ Dependencias Python
-    │   │   ├── run_consumer.sh          # ⚠️ NECESITA AJUSTE (python -> python3)
     │   │   ├── README.md
     │   │   ├── GUIA_IMPLEMENTACION.md
     │   │   └── SETUP_RAPIDO.md
-    │   │
-    │   ├── 📂 data-processor/           # 🔜 Por implementar
-    │   ├── 📂 mongo-persister/          # 🔜 Por implementar
-    │   ├── 📂 sql-persister/            # 🔜 Por implementar
-    │   └── 📂 api/                      # 🔜 Por implementar
+    │   │ 
+    │   ├── 📂 data-processor/           # 🔜 Consumer Kafka --> MongoDB raw_messages (collection)
+    │   │   └── 📂 src
+    │   │        └── processor.py
+    │   ├── 📂 mongo-persister/          # 🔜 MongoDB raw_messages --> datos agregados 
+    │   │    └── 📂 src
+    │   │    │    └── persister.py
+    │   │    └── 📂 tests/               # 🔧 Test unitarios (pytest)
+    │   │           └── pytest.ini
+    │   └── 📂 sql-persister/            # 🔜 ETL (datos agregados --> Supabase PostgresSQL)
+    │       └── 📂 src
+    │           └── persister.py
     │
-    └── 📂 shared/                       # 🔜 Código compartido (por crear)
+    └── 📂 shared/                       
         ├── database/
         ├── models/
-        └── utils/
+        └── utils/                        # 🔜 Scripts management dockers, estadísticas, monitorización
 ```
 
 ---
@@ -396,7 +401,7 @@ docker logs -f kafka-consumer
 
 ### Documentos en tu proyecto:
 - `README.md` - Documentación principal
-- `GUIA_IMPLEMENTACION.md` - Guía de implementación
+- `GUIA_TECNICA.md` - Guía de implementación
 - `SETUP_RAPIDO.md` - Setup rápido
 - `docker-compose-kafka-comentado.yml` - **NUEVO: Versión comentada**
 

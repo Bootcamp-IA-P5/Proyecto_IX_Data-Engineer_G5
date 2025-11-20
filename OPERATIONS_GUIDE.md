@@ -41,15 +41,21 @@
            │
            ▼
   ┌─────────────────┐
-  │ Mongo Persister │  Consumer: "mongo-persister-group"
-  │   (Consumer)    │  Batch: 100 mensajes
-  └────────┬────────┘
+  │ Mongo Persister │  DB: hrpro_db
+  │ (raw_messages)  │  Collection: raw_messages
+  └────────┬────────┘  ontainer Consumer: "mongo-persister"
            │
            ▼
   ┌─────────────────┐
   │    MongoDB      │  DB: hrpro_db
-  │  (raw_messages) │  Collection: raw_messages
-  └─────────────────┘
+  │(aggregated_data)│  Collection: aggregated_data
+  └─────────────────┘  Container: "data-processor"
+           │
+           ▼
+  ┌─────────────────┐
+  │    PostgresSQL  │  DB: hrpto_db  
+  │    (Supabase)   │  
+  └─────────────────┘   
 ```
 
 ---
